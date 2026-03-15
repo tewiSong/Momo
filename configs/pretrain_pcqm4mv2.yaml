@@ -1,0 +1,96 @@
+dataset:
+  preprocessed_path: data/pcqm4m_v2_motif_preprocessed.pkl
+  batch_size: 8
+  num_workers: 2
+  shuffle: true
+  max_atomic_num: 100  # 原子编号上限（用于Embedding大小），断言会检查输入不越界
+  val_ratio: 0.05      # 训练/验证划分比例
+
+model:
+  hidden_dim: 256
+  num_gin_layers: 5
+  gin_mlp_hidden: 256
+  dropout: 0.1
+  z3d_dim: 7            # 预处理的局部3D特征维度：长度均值/方差、角度均值/方差、惯性主轴特征值(3)
+  codebook_size: 128
+  expert_mlp_hidden: 256
+  readout: sum          # sum 或 attention
+  codebook_init:
+    name: kmeans        # 选项：random | kmeans
+    sample_size: 200000 # 从全量样本中均匀抽样用于聚类（不足则用全部）
+    max_iters: 30
+    tol: 1.0e-4
+
+loss:
+  recon_weight: 1.0
+  vq_weight: 1.0
+  commit_weight: 0.25
+  commit_ramp_steps: 50000   # 避免早期强绑定码本，线性升温
+  # 融合路由的附加损失权重（需显式设置，避免默认掩盖问题）
+  kl_weight: 0.2
+  ce_weight: 0.0          # 默认关闭硬标签 CE（可改用极小权重）
+  ent_weight: 0.02        # 在 y_soft 上做熵正则，鼓励多样使用
+  # Teacher 改为对齐到 z_gt 的监督；蒸馏相关默认关闭，避免主导损失
+  teacher_align_weight: 0.1
+  vq_teacher_weight: 0.0
+  recon_teacher_weight: 0.0
+  # 自动调度：当 teacher_align 低于阈值并持续若干次评估后，线性升温到目标权重
+  teacher_auto:
+    mode: align_gate         # off|align_gate|linear
+    align_threshold: 0.25    # 触发阈值（MSE，已在 z3d 标准化空间）
+    patience: 3              # 连续满足阈值的评估次数
+    start_after_step: 50000  # 至少训练到该步数后才允许触发
+    ramp_steps: 100000       # 触发后的线性升温步数
+    vq_max: 0.1              # 目标最大权重（升温终值）
+    recon_max: 0.05          # 目标最大权重（升温终值）
+
+optim:
+  lr: 1e-3
+
+misc:
+  device: cuda
+  epochs: 50
+  log_every_steps: 50
+  eval_every_epochs: 1
+  eval_every_steps: 5000   # 额外按步评估，并用 global_step 记录
+  seed: 42
+  log_dir: runs
+  save_dir: checkpoints
+  save_every_epochs: 5
+  resume: ""   # 为空则不恢复；或填写 ckpt 路径
+  use_amp: true
+  grad_clip_norm: 1.0   # 梯度裁剪上限（>0 启用）
+  save_best_only: false   # 仅保存 best 与 last
+  early_stop_patience: 0  # 0 表示关闭 early stopping
+  min_delta: 0.0          # 最小改进阈值（用于 early stopping 与 best）
+
+scheduler:
+  name: cosine      # 可选：none|step|plateau|cosine
+  eta_min: 1.0e-5
+
+router:
+  distance_temperature: 0.5   # p_nn 的温度（越小越尖锐）
+  teacher_temperature: 1.0    # 几何教师分布温度（teacher_z/z_gt 到 code 的软分布）
+  gumbel_tau_start: 1.0       # p_r 的初始 Gumbel-Softmax 温度
+  gumbel_tau_end: 0.2         # p_r 的最终温度
+  beta_start: 0.0             # 融合权重起始（更信教师）
+  beta_end: 0.7               # 融合权重终值（逐步信路由）
+  warmup_steps: 50000         # 从 start 线性过渡到 end 的步数
+  topk: 4                     # 融合后 Top-K 选通，1 表示 Top-1
+  topk_warmup_steps: 50000    # 早期不稀疏（使用期望向量），提升码本使用度
+  # 训练后期轻微升温 tau_r，提升码本使用度（可选）
+  tau_r_boost:
+    start_step: 400000        # 在该步之后开始由 tau_end -> end_tau 的线性过渡
+    duration: 100000          # 过渡步数
+    end_tau: 0.30             # 最终温度，略高于 0.2 即可
+
+teacher:
+  enabled: true
+  # 从根源修复：先只训练投影层对齐到 z_gt，teacher 主干默认冻结
+  trainable: false
+  proj_trainable: true
+  hidden_dim: 128
+  num_filters: 128
+  num_interactions: 6
+  num_gaussians: 50
+  cutoff: 10.0

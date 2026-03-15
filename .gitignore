@@ -1,0 +1,7 @@
+GraphMVP/
+checkpoints/
+data/
+dcgm/
+*.*.out
+*.*.err
+checkpoints
