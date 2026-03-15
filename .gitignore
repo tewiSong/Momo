@@ -5,3 +5,7 @@ dcgm/
 *.*.out
 *.*.err
 checkpoints
+momo/train/__pycache__/
+momo/tools/__pycache__/
+momo/models/__pycache__/
+momo/__pycache__/
