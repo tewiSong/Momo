@@ -25,7 +25,7 @@
 - 断点恢复
   - `python -m momo.train.pretrain --cfg configs/pretrain_pcqm4mv2.yaml --run_name pretrain-local --resume checkpoints/pretrain-local/last.ckpt`
 
-- Slurm 提交
+- 预训练
   - `sbatch scripts/submit_pretrain.sh`
 
 - 微调数据预处理（MoleculeNet 批量）
@@ -33,3 +33,17 @@
 
 - 生成划分（MoleculeNet，scaffold）
   - `sbatch scripts/gen_moleculenet_splits.sh`
+
+- 微调与测试（MoleculeNet 批量）
+  - `sbatch scripts/finetune_moleculenet.sh`
+  - 切换数据集：`DATASETS="bbbp,tox21" sbatch scripts/finetune_moleculenet.sh`（逗号分隔支持批量）
+  - 切换 checkpoint：`CKPT=checkpoints/<your-pretrain>/best.ckpt sbatch scripts/finetune_moleculenet.sh`
+  - 切换数据根与划分：`ROOT=data/MoleculeNet MODE=scaffold SEED=0 sbatch scripts/finetune_moleculenet.sh`
+  - 示例（在 bbbp 上用指定 checkpoint 微调）：
+
+```
+ROOT=data/MoleculeNet \
+CKPT=checkpoints/pretrain-pcqm4mv2-20260310-180746-gpu214-02/best.ckpt \
+DATASETS="bbbp" MODE=scaffold SEED=0 EPOCHS=100 BATCH=256 LR=1e-3 LR_SCALE=5 POOL=sum \
+sbatch scripts/finetune_moleculenet.sh
+```

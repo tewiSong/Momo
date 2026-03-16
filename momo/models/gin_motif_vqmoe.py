@@ -138,7 +138,14 @@ class MotifVQMoE(nn.Module):
                 num_gaussians=int(tcfg['num_gaussians']),
                 cutoff=float(tcfg['cutoff'])
             )
-            self.teacher_proj = nn.Linear(th, self.z3d_dim)
+            # 高阶聚合：在 motif 级别拼接一阶均值与二阶方差信息，再用非线性头映射到 z3d 维
+            in_dim = th * 2
+            self.teacher_proj = nn.Sequential(
+                nn.LayerNorm(in_dim),
+                nn.Linear(in_dim, th),
+                nn.ReLU(),
+                nn.Linear(th, self.z3d_dim),
+            )
 
     def set_router_params(self, tau_r: float, beta: float) -> None:
         self._tau_r = float(tau_r)
@@ -202,8 +209,13 @@ class MotifVQMoE(nn.Module):
                 pos_f32 = data.pos.float()
                 batch_i64 = data.batch
                 h_atom_3d = self.teacher(z_i64, pos_f32, batch_i64)
-                h_motif_3d = self.motif_pool(h_atom_3d, motif_gidx, num_global_motifs)
-                tz = self.teacher_proj(h_motif_3d)
+                # 一阶均值
+                mu = self.motif_pool(h_atom_3d, motif_gidx, num_global_motifs)
+                # 二阶：均方 - 均值平方，截断到非负，提供局部几何的二阶统计
+                e2 = self.motif_pool(h_atom_3d * h_atom_3d, motif_gidx, num_global_motifs)
+                var = torch.clamp(e2 - mu * mu, min=0.0)
+                h_motif_local = torch.cat([mu, var], dim=-1)
+                tz = self.teacher_proj(h_motif_local)
                 # 将 teacher 输出对齐到与 z_gt 相同的标准化空间
                 if self._z3d_norm_set:
                     tz = (tz - self.z3d_mean) / self.z3d_std

@@ -1,0 +1,38 @@
+defaults:
+  epochs: 100
+  batch_size: 256
+  lr: 1.0e-3
+  lr_scale: 5.0
+  graph_pooling: sum   # sum | mean
+  freeze_codebook: true
+
+per_dataset:
+  # 多任务/大数据集，适当减小 batch
+  toxcast:
+    batch_size: 128
+    epochs: 80
+  muv:
+    batch_size: 128
+
+  # 其它分类任务
+  tox21:
+    epochs: 100
+  bbbp: {}
+  clintox: {}
+  sider:
+    batch_size: 192
+  hiv: {}
+  bace: {}
+
+  # 回归任务：训练步数可略多
+  esol:
+    epochs: 120
+  freesolv:
+    epochs: 200
+  lipophilicity:
+    epochs: 150
+  malaria:
+    epochs: 120
+  cep:
+    epochs: 120
+

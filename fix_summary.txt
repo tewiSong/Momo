@@ -1,3 +1,4 @@
+0312:
 问题归因（根源）：
 - 监督与决策不一致：正则/监督主要作用在 p_r（路由器分布）或 p_nn（基于 h_commit 最近邻），但真正选码是 y_soft∝p_r^β·p_nn^(1−β)。当 p_nn 很硬时，y_soft 被其主导，导致在 p_r 上的正则基本不起作用，码本使用塌缩。
 - 强制最近邻：CE 把 p_r 拉向“最近邻硬标签”，抵消了熵正则和探索；Top‑K 过早稀疏化使大部分 code 进不了梯度通路。
@@ -36,3 +37,34 @@
 - momo/train/pretrain.py（Stage A/B 门控、commit ramp、Top‑K 延迟与额外日志）
 - configs/pretrain_pcqm4mv2.yaml（新增与调整配置）
 
+0316:
+
+
+根因（进一步确认）：
+- 教师对齐不可达：教师链路为 SchNet 原子表征 → motif 均值池化 → 线性投影 → 标准化，仅含一阶统计，难以回归 z_gt 中的二阶量（长度/角度方差、惯性主轴特征值）。
+- 数值放大：在 z_gt 的标准化空间对齐，个别维度 std 极小导致误差被成百上千倍放大，teacher_align 长期居高。
+- 策略卡死：校准阶段把 recon/vq/commit 等主损失全部关闭，训练只能在对齐一条路上“干跑”，主干/路由/码本得不到纠错与驱动，形成闭环自锁。
+
+本次修复（不弃用 3D 教师）：
+1) 教师高阶聚合（表达阶次对齐 z_gt）
+   - 在教师分支的 motif 聚合处，同时计算一阶均值 mu 与二阶方差 var（通过均方减均值平方），作为教师局部几何输入；再用 MLP(+LayerNorm) 投影至 7 维。
+   - 代码：
+     - momo/models/gin_motif_vqmoe.py:116–123（teacher_proj: Linear → MLP(+LN)，输入维=2×hidden）。
+     - momo/models/gin_motif_vqmoe.py:211–219（mu/var 聚合并投影）。
+   - 仍对 teacher_z 使用数据集统计的均值/方差标准化，以保持与 z_gt 的标尺一致。
+
+2) 取消“硬门控”，主任务常开
+   - 校准阶段不再把 recon/vq/commit/路由正则全部置零，仅关闭两项 teacher 蒸馏；commit 继续按 ramp 升温。
+   - 代码：momo/train/pretrain.py:303–319。
+
+兼容与运行提示：
+- 旧 ckpt 不兼容（teacher_proj 结构变化）；不要从旧 ckpt 恢复。
+- 若早期 p_t 仍偏尖，可将 router.teacher_temperature 提至 2–4，并保持 topk_warmup_steps 使早期用期望向量。
+
+验证指标（预期变化）：
+- teacher_align 明显下降（不再 1e5 级震荡）；
+- train/router/effective_codes ↑，usage_unique_ratio ↑，train/ent > 0；topk_nn_hit 不再长期≈1；
+- train/recon 稳定下降、train/commit 按 ramp 平滑上升，总损失不再被对齐项主导。
+
+后续可选：
+- 如需支持全分子 3D 属性（QM），可并行新增“motif‑level 3D 交互”的教师辅助分支及对应损失，不进入 z_gt 对齐路径，以免语义错位。

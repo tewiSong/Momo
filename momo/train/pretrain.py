@@ -299,15 +299,21 @@ def main():
     def current_weights(step: int):
         w = dict(loss_base)
         vq_w, rc_w = 0.0, 0.0
-        # 校准阶段：仅启用 teacher_align
+        # 校准阶段不再硬关主损失：保留主任务，蒸馏项仍为 0
         if calib_active:
-            w['recon_weight'] = 0.0
-            w['vq_weight'] = 0.0
-            # commit 也暂时关闭，避免早期强绑定
-            w['commit_weight'] = 0.0
-            w['kl_weight'] = 0.0
-            w['ce_weight'] = 0.0
-            w['ent_weight'] = 0.0
+            # 主任务保持开启
+            w['recon_weight'] = float(loss_base.get('recon_weight', 1.0))
+            w['vq_weight'] = float(loss_base.get('vq_weight', 1.0))
+            # commit 在校准期也按预设线性升温，避免早期强绑定
+            if commit_ramp_steps > 0:
+                p_commit = min(1.0, float(step) / float(commit_ramp_steps))
+                w['commit_weight'] = float(loss_base.get('commit_weight', 0.0)) * p_commit
+            else:
+                w['commit_weight'] = float(loss_base.get('commit_weight', 0.0))
+            # 保留路由正则（若配置为非零），但关闭 teacher 蒸馏两项
+            w['kl_weight'] = float(loss_base.get('kl_weight', 0.0))
+            w['ce_weight'] = float(loss_base.get('ce_weight', 0.0))
+            w['ent_weight'] = float(loss_base.get('ent_weight', 0.0))
             w['vq_teacher_weight'] = 0.0
             w['recon_teacher_weight'] = 0.0
             return w, vq_w, rc_w
