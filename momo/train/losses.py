@@ -39,6 +39,7 @@ def compute_losses(
         kl = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
         ce = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
         ent = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
+        balance = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
         if router is not None:
             # 将监督与正则统一到“真正用于选码”的分布 y_soft
             y_soft = router.get('y_soft')
@@ -55,6 +56,12 @@ def compute_losses(
                 kl = kl1 + kl2
                 # 直接在 y_soft 上做熵正则，鼓励使用更多 code
                 ent = -torch.sum(ys * torch.log(ys), dim=-1).mean()
+                # 轻量级“负载均衡”：将批内平均分布拉向均匀分布，缓解马太效应
+                # p_bar: [K]
+                p_bar = ys.mean(dim=0)
+                K = p_bar.numel()
+                uniform = torch.full_like(p_bar, 1.0 / float(max(1, K)))
+                balance = torch.sum((p_bar - uniform) ** 2)
             # 可选：还保留一个与教师最近邻的 CE 监督（默认权重为 0）
             if logits is not None and teacher_nn_index is not None:
                 ce = F.cross_entropy(logits.float(), teacher_nn_index.long())
@@ -62,7 +69,9 @@ def compute_losses(
             kl_w = float(weights.get('kl_weight', 0.0))
             ce_w = float(weights.get('ce_weight', 0.0))
             ent_w = float(weights.get('ent_weight', 0.0))
-            loss = loss + kl_w * kl + ce_w * ce + ent_w * ent
+            bal_w = float(weights.get('balance_weight', 0.0))
+            # 注意：为了“鼓励更高的熵”，应最小化 -H(p)。保持 ent 为正的 H(p)，在总损失中以负号加入
+            loss = loss + kl_w * kl + ce_w * ce - ent_w * ent + bal_w * balance
 
         # Teacher 相关损失（显式权重控制）
         vq_teacher = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
@@ -93,6 +102,7 @@ def compute_losses(
         'kl': kl,
         'ce': ce,
         'ent': ent,
+        'balance': balance,
         'vq_teacher': vq_teacher,
         'recon_teacher': recon_teacher,
         'teacher_align': teacher_align,

@@ -109,6 +109,8 @@ class MotifVQMoE(nn.Module):
         # Teacher (3D encoder) 配置
         tcfg = cfg.get('teacher', None)
         self.teacher_enabled = bool(tcfg and tcfg.get('enabled', False))
+        # 在 teacher 对齐前，可选择不使用 teacher_z 构造 p_t（由训练循环动态门控）
+        self.use_teacher_for_pt = True
 
         readout = str(mcfg['readout']).lower()
         assert readout in ['sum', 'attention']
@@ -150,6 +152,14 @@ class MotifVQMoE(nn.Module):
     def set_router_params(self, tau_r: float, beta: float) -> None:
         self._tau_r = float(tau_r)
         self._beta = float(beta)
+
+    # 动态调整教师分布温度（用于训练后期收敛到更“冷”的几何原型）
+    def set_teacher_temperature(self, t: float) -> None:
+        self.teacher_temperature = float(t)
+
+    # 训练循环可调用：控制是否使用 teacher_z 生成 p_t（未对齐阶段关闭以避免牵制）
+    def set_use_teacher_for_pt(self, use: bool) -> None:
+        self.use_teacher_for_pt = bool(use)
 
     def set_z3d_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         """设置与数据一致的 z3d 归一化均值与方差，用于对齐 teacher 输出空间。
@@ -201,7 +211,7 @@ class MotifVQMoE(nn.Module):
 
         # Teacher 3D Encoder（仅预训练阶段使用），返回 motif 级 teacher 表征投影到 z3d 维
         teacher_z = None
-        if self.teacher_enabled:
+        if self.teacher_enabled and self.use_teacher_for_pt:
             assert hasattr(data, 'pos'), 'teacher.enabled=True 但 batch 中无 pos'
             # 教师网络对数值稳定性更敏感，强制在 FP32 通道前向，避免 AMP 半精度导致的溢出/NaN
             with torch.cuda.amp.autocast(enabled=False):
@@ -247,29 +257,34 @@ class MotifVQMoE(nn.Module):
         eps = 1e-9
         pr = torch.clamp(p_r, min=eps)
         pt = torch.clamp(p_t, min=eps)
-        y_soft = (pr.pow(self._beta) * pt.pow(max(0.0, 1.0 - self._beta)))
-        y_soft = y_soft / (y_soft.sum(dim=-1, keepdim=True) + eps)
+        y_soft = pr
 
-        # 可选 Top-K 稀疏化
-        if self.router_topk > 1:
+        # 可选 Top-K 稀疏化/硬化
+        # 约定：
+        #   - router_topk == 0: 禁用稀疏与硬化，直接使用软分布（期望向量），避免早期梯度饥饿
+        #   - router_topk == 1: Top-1 ST 硬化
+        #   - router_topk  > 1: Top-K 稀疏 + ST（按被选中的 K 个概率归一化）
+        if self.router_topk == 0:
+            topk_idx = torch.argmax(y_soft, dim=-1)  # 仅用于监控
+            y = y_soft  # 不进行硬化，直接使用软分布
+            y_hard = y_soft  # 记录到 router_info 供可视化
+        elif self.router_topk > 1:
             k = min(self.router_topk, self.codebook_size)
             vals, idx = torch.topk(y_soft, k=k, dim=-1)
             mask = torch.zeros_like(y_soft)
             mask.scatter_(dim=1, index=idx, src=torch.ones_like(vals))
             y_sparse = y_soft * mask
             y_sparse = y_sparse / (y_sparse.sum(dim=-1, keepdim=True) + eps)
-            y_soft = y_sparse
+            # ST：前向稀疏、反向走原 y_soft
+            y_hard = torch.zeros_like(y_soft)
+            y_hard.scatter_(1, idx, vals / (vals.sum(dim=-1, keepdim=True) + eps))
+            y = y_hard + (y_soft - y_hard).detach()
             topk_idx = idx[:, 0]
         else:
             topk_idx = torch.argmax(y_soft, dim=-1)
-
-        # ST 硬化（支持 top-1 或按选中索引的概率权重）
-        y_hard = torch.zeros_like(y_soft)
-        if self.router_topk > 1:
-            y_hard.scatter_(1, idx, vals / (vals.sum(dim=-1, keepdim=True) + eps))
-        else:
+            y_hard = torch.zeros_like(y_soft)
             y_hard.scatter_(1, topk_idx.view(-1, 1), 1.0)
-        y = y_hard + (y_soft - y_hard).detach()
+            y = y_hard + (y_soft - y_hard).detach()
 
         # 选取 code 的期望向量（ST 允许反传）
         e_k = y.matmul(self.codebook.codes)
@@ -297,12 +312,10 @@ class MotifVQMoE(nn.Module):
             router_info['teacher_z'] = teacher_z
         return z_hat, h_commit, e_k, logits, topk_idx, router_info
 
-    # 允许训练过程中调整 Top-K 稀疏化强度（0 或 1 表示 Top-1 / 禁用稀疏化）
+    # 允许训练过程中调整 Top-K 稀疏化强度
+    # 约定：k==0 表示禁用稀疏与硬化（用软分布期望）；k==1 为 Top-1；k>1 为 Top-K
     def set_topk(self, k: int) -> None:
-        if int(k) <= 1:
-            self.router_topk = int(k)
-        else:
-            self.router_topk = int(k)
+        self.router_topk = int(k)
 
     def readout(self, h_motif: torch.Tensor, motif_gidx: torch.Tensor, num_graphs: int) -> torch.Tensor:
         # 将 motif 特征聚合为分子级表示

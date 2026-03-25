@@ -43,7 +43,7 @@
 
 ```
 ROOT=data/MoleculeNet \
-CKPT=checkpoints/pretrain-pcqm4mv2-20260310-180746-gpu214-02/best.ckpt \
-DATASETS="bbbp" MODE=scaffold SEED=0 EPOCHS=100 BATCH=256 LR=1e-3 LR_SCALE=5 POOL=sum \
+CKPT=checkpoints/pretrain-pcqm4mv2-20260315-234536-gpu212-10/best.ckpt \
+DATASETS="bbbp" MODE=scaffold SEED=0 EPOCHS=120 BATCH=256 LR=1e-3 LR_SCALE=5 POOL=sum \
 sbatch scripts/finetune_moleculenet.sh
 ```

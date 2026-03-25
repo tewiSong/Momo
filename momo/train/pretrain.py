@@ -110,7 +110,7 @@ def eval_epoch(model: torch.nn.Module,
                loss_cfg: Dict[str, float]) -> Dict[str, float]:
     model.eval()
     tot = 0
-    sums = {k: 0.0 for k in ['loss', 'recon', 'vq', 'commit', 'kl', 'ce', 'ent', 'vq_teacher', 'recon_teacher', 'teacher_align']}
+    sums = {k: 0.0 for k in ['loss', 'recon', 'vq', 'commit', 'kl', 'ce', 'ent', 'balance', 'vq_teacher', 'recon_teacher', 'teacher_align']}
     with torch.no_grad():
         for batch in dl:
             batch = batch.to(device)
@@ -296,6 +296,22 @@ def main():
     # commit 权重线性升温步数（避免早期强绑定码本）
     commit_ramp_steps = int(cfg.get('loss', {}).get('commit_ramp_steps', 50000))
 
+    def _apply_weight_schedule(base_w: float, sched: Dict[str, float], step: int) -> float:
+        """线性调度辅助：从 base_w 过渡到 sched['end_weight']，
+        在 sched['start_step'] 开始、历时 sched['duration'] 步完成。若未提供则返回 base_w。
+        """
+        if not isinstance(sched, dict):
+            return float(base_w)
+        end_w = float(sched.get('end_weight', base_w))
+        start = int(sched.get('start_step', -1))
+        dur = int(sched.get('duration', 0))
+        if start < 0 or dur <= 0:
+            return float(base_w)
+        if step <= start:
+            return float(base_w)
+        p = min(1.0, max(0.0, float(step - start) / float(dur)))
+        return float(base_w) + (end_w - float(base_w)) * p
+
     def current_weights(step: int):
         w = dict(loss_base)
         vq_w, rc_w = 0.0, 0.0
@@ -310,10 +326,18 @@ def main():
                 w['commit_weight'] = float(loss_base.get('commit_weight', 0.0)) * p_commit
             else:
                 w['commit_weight'] = float(loss_base.get('commit_weight', 0.0))
-            # 保留路由正则（若配置为非零），但关闭 teacher 蒸馏两项
-            w['kl_weight'] = float(loss_base.get('kl_weight', 0.0))
+            # 校准阶段：关闭 KL（避免未对齐教师牵制 y_soft）
+            w['kl_weight'] = 0.0
             w['ce_weight'] = float(loss_base.get('ce_weight', 0.0))
-            w['ent_weight'] = float(loss_base.get('ent_weight', 0.0))
+            # 对探索相关权重增加“后期退火”调度
+            ent_base = float(loss_base.get('ent_weight', 0.0))
+            bal_base = float(loss_base.get('balance_weight', 0.0))
+            w['ent_weight'] = _apply_weight_schedule(
+                ent_base, cfg['loss'].get('ent_schedule', {}), step
+            )
+            w['balance_weight'] = _apply_weight_schedule(
+                bal_base, cfg['loss'].get('balance_schedule', {}), step
+            )
             w['vq_teacher_weight'] = 0.0
             w['recon_teacher_weight'] = 0.0
             return w, vq_w, rc_w
@@ -338,6 +362,11 @@ def main():
         # teacher 蒸馏两项（若启用）
         w['vq_teacher_weight'] = float(vq_w)
         w['recon_teacher_weight'] = float(rc_w)
+        # 后期退火：熵与均衡
+        ent_base = float(loss_base.get('ent_weight', 0.0))
+        bal_base = float(loss_base.get('balance_weight', 0.0))
+        w['ent_weight'] = _apply_weight_schedule(ent_base, cfg['loss'].get('ent_schedule', {}), step)
+        w['balance_weight'] = _apply_weight_schedule(bal_base, cfg['loss'].get('balance_schedule', {}), step)
         return w, vq_w, rc_w
 
     # 路由调度参数（必须配置，不做静默回退）
@@ -349,6 +378,15 @@ def main():
     beta_end = float(rcfg['beta_end'])
     warmup_steps = int(rcfg['warmup_steps'])
     topk_warmup_steps = int(rcfg.get('topk_warmup_steps', 0))
+    # 可选：教师温度退火（高→低），以及晚期将 β 提升到更大值
+    tt_start = float(rcfg.get('teacher_temperature_start', rcfg.get('teacher_temperature', 1.0)))
+    tt_end = float(rcfg.get('teacher_temperature_end', tt_start))
+    tt_decay_start = int(rcfg.get('teacher_temp_decay_start', -1))
+    tt_decay_steps = int(rcfg.get('teacher_temp_decay_steps', 0))
+    beta_boost = rcfg.get('beta_boost', None)
+    beta_boost_start = int(beta_boost.get('start_step', -1)) if isinstance(beta_boost, dict) else -1
+    beta_boost_dur = int(beta_boost.get('duration', 0)) if isinstance(beta_boost, dict) else 0
+    beta_boost_end = float(beta_boost.get('end_beta', beta_end)) if isinstance(beta_boost, dict) else beta_end
 
     # 可选：训练后期提升 tau_r 的二阶段调度，提升码本使用度
     boost_cfg = rcfg.get('tau_r_boost', None)
@@ -397,6 +435,7 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         print(f"Epoch {epoch}/{epochs} - training...")
         model.train()
+        safeguard_until_step = -1
         for it, batch in enumerate(dl_train, start=1):
             batch = batch.to(device)
             # 线性调度 tau_r 与 beta（前 warmup_steps 过渡，之后恒定为 end）
@@ -409,12 +448,57 @@ def main():
                 p2 = 0.0 if p2 < 0.0 else (1.0 if p2 > 1.0 else p2)
                 cur_tau_r = cur_tau_r + (boost_end_tau - cur_tau_r) * p2
             cur_beta = beta_start + (beta_end - beta_start) * progress
+            # 晚期将 β 进一步提升，逐渐更依赖路由器（避免长期过度均匀）
+            if beta_boost_start >= 0 and beta_boost_dur > 0:
+                p_b = (float(global_step) - float(beta_boost_start)) / float(max(1, beta_boost_dur))
+                p_b = 0.0 if p_b < 0.0 else (1.0 if p_b > 1.0 else p_b)
+                cur_beta = cur_beta + (beta_boost_end - cur_beta) * p_b
             model.set_router_params(cur_tau_r, cur_beta)
-            # Top-K 稀疏化的延迟启用：早期不稀疏，提升码本使用度
-            if topk_warmup_steps > 0 and global_step < topk_warmup_steps:
-                model.set_topk(0)  # 等价于禁用 Top-K，使用期望向量
+            # Safeguard: if previously flagged, temporarily soften routing
+            if 'safeguard_until_step' in locals() and global_step < safeguard_until_step:
+                # clamp beta and use softer selection
+                cur_beta = min(cur_beta, 0.6)
+                model.set_router_params(cur_tau_r, cur_beta)
+                # also raise teacher temperature a bit if available
+                if hasattr(model, 'teacher_temperature'):
+                    try:
+                        model.set_teacher_temperature(max(float(getattr(model,'teacher_temperature',2.6)), 2.8))
+                    except Exception:
+                        pass
+
+            # 教师温度退火：从较高温度逐步降低到更“冷”的几何原型
+            if tt_decay_steps > 0 and tt_decay_start >= 0:
+                p_tt = (float(global_step) - float(tt_decay_start)) / float(max(1, tt_decay_steps))
+                p_tt = 0.0 if p_tt < 0.0 else (1.0 if p_tt > 1.0 else p_tt)
+                cur_tt = tt_start + (tt_end - tt_start) * p_tt
+                model.set_teacher_temperature(cur_tt)
+            # Top-K 分段调度（优先使用可选 schedule；否则退回原 warmup 逻辑）
+            tks = rcfg.get('topk_schedule', None)
+            if isinstance(tks, dict):
+                s1 = int(tks.get('stage1_until', topk_warmup_steps))
+                s2 = int(tks.get('stage2_until', s1))
+                k2 = int(tks.get('stage2_k', 4))
+                kf = int(tks.get('final_k', int(rcfg.get('topk', 1))))
+                if global_step < s1:
+                    model.set_topk(0)
+                elif global_step < s2:
+                    model.set_topk(k2)
+                else:
+                    model.set_topk(kf)
             else:
-                model.set_topk(int(rcfg.get('topk', 1)))
+                # 旧逻辑：仅 warmup 后启用固定 Top‑K
+                if topk_warmup_steps > 0 and global_step < topk_warmup_steps:
+                    model.set_topk(0)
+                else:
+                    model.set_topk(int(rcfg.get('topk', 1)))
+            # 校准时禁用 teacher_z 构造 p_t；对齐后再启用
+            try:
+                model.set_use_teacher_for_pt(not calib_active)
+            except Exception:
+                pass
+            # Safeguard forces soft selection (expectation) for a short window
+            if 'safeguard_until_step' in locals() and global_step < safeguard_until_step:
+                model.set_topk(0)
             # 当前 teacher 动态权重
             weights_cur, vq_w_cur, rc_w_cur = current_weights(global_step)
             with torch.cuda.amp.autocast(enabled=use_amp):
@@ -489,13 +573,19 @@ def main():
                     used = torch.unique(sel).numel() / float(model.codebook_size)
                     writer.add_scalar('train/router/usage_unique_ratio', used, global_step)
                     writer.add_histogram('train/router/selected_codes', sel.to(torch.float32), global_step)
-                # 有效代码数（基于融合分布的 batch mean）
+                # 有效代码数（两种口径：batch-mean 与 sample-mean）
                 y_soft = router_info['y_soft'].detach()
                 p_t = router_info.get('p_t', None)
                 p_mean = y_soft.mean(dim=0)
                 eps = 1e-8
                 eff = torch.exp(-(p_mean * (p_mean + eps).log()).sum()).item()
                 writer.add_scalar('train/router/effective_codes', eff, global_step)
+                ys_clamped = torch.clamp(y_soft, min=eps)
+                ent_per = (-ys_clamped * ys_clamped.log()).sum(dim=-1)
+                eff_sample = torch.exp(ent_per).mean().item()
+                writer.add_scalar('train/router/effective_codes_sample', eff_sample, global_step)
+                # Write safeguard flag
+                writer.add_scalar('train/router/safeguard_active', 1.0 if ('safeguard_until_step' in locals() and global_step < safeguard_until_step) else 0.0, global_step)
                 # 额外监控：与教师分布的匹配度
                 if p_t is not None:
                     pt = p_t.detach()
@@ -506,17 +596,47 @@ def main():
                     writer.add_scalar('train/router/kl_to_teacher', kl1 + kl2, global_step)
                     writer.add_scalar('train/router/y_soft_entropy', float((-ys * ys.log()).sum(dim=-1).mean().item()), global_step)
                     writer.add_scalar('train/router/p_t_entropy', float((-ptc * ptc.log()).sum(dim=-1).mean().item()), global_step)
+                    # Trigger safeguard with hysteresis: BOTH low entropy and low effective codes (sample-wise)
+                    try:
+                        ent_val = float((-ys * ys.log()).sum(dim=-1).mean().item())
+                    except Exception:
+                        ent_val = 0.0
+                    bad = (ent_val < 0.05) and (eff_sample < 8.0)
+                    # Initialize counters if missing
+                    if 'sg_bad_count' not in locals():
+                        sg_bad_count = 0
+                    if 'sg_good_count' not in locals():
+                        sg_good_count = 0
+                    # Activate only when not currently active and we saw enough consecutive bad signals
+                    if ('safeguard_until_step' not in locals()) or (global_step >= safeguard_until_step):
+                        if bad:
+                            sg_bad_count += 1
+                            sg_good_count = 0
+                        else:
+                            sg_good_count += 1
+                            sg_bad_count = 0
+                        if bad and sg_bad_count >= 5:
+                            safeguard_until_step = global_step + 2000
+                    else:
+                        # During safeguard window, allow early release after consecutive good observations
+                        if not bad:
+                            sg_good_count += 1
+                            if sg_good_count >= 5:
+                                safeguard_until_step = global_step
                 if 'vq_teacher' in losses:
                     writer.add_scalar('train/vq_teacher', float(losses['vq_teacher'].detach().cpu()), global_step)
                     writer.add_scalar('train/recon_teacher', float(losses['recon_teacher'].detach().cpu()), global_step)
                     writer.add_scalar('train/teacher_align', float(losses['teacher_align'].detach().cpu()), global_step)
+                if 'balance' in losses:
+                    writer.add_scalar('train/router/balance', float(losses['balance'].detach().cpu()), global_step)
                 print(f"step {global_step}: loss={float(losses['loss'].detach().cpu()):.4f}"
                       f" recon={float(losses['recon'].detach().cpu()):.4f}"
                       f" vq={float(losses['vq'].detach().cpu()):.4f}"
                       f" commit={float(losses['commit'].detach().cpu()):.4f}"
                       f" kl={float(losses['kl'].detach().cpu()):.4f}"
                       f" ce={float(losses['ce'].detach().cpu()):.4f}"
-                      f" ent={float(losses['ent'].detach().cpu()):.4f}")
+                      f" ent={float(losses['ent'].detach().cpu()):.4f}"
+                      f" balance={float(losses['balance'].detach().cpu()):.4f}")
 
             global_step += 1
 
@@ -563,6 +683,7 @@ def main():
             writer.add_scalar('val/kl', metrics['kl'], global_step)
             writer.add_scalar('val/ce', metrics['ce'], global_step)
             writer.add_scalar('val/ent', metrics['ent'], global_step)
+            writer.add_scalar('val/balance', metrics['balance'], global_step)
             writer.add_scalar('val/vq_teacher', metrics['vq_teacher'], global_step)
             writer.add_scalar('val/recon_teacher', metrics['recon_teacher'], global_step)
             writer.add_scalar('val/teacher_align', metrics['teacher_align'], global_step)

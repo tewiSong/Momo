@@ -24,12 +24,22 @@ model:
 loss:
   recon_weight: 1.0
   vq_weight: 1.0
-  commit_weight: 0.25
-  commit_ramp_steps: 50000   # 避免早期强绑定码本，线性升温
+  commit_weight: 0.12
+  commit_ramp_steps: 200000   # 进一步放缓早期绑定，避免过早锁定少数码
   # 融合路由的附加损失权重（需显式设置，避免默认掩盖问题）
-  kl_weight: 0.2
+  kl_weight: 0.1
   ce_weight: 0.0          # 默认关闭硬标签 CE（可改用极小权重）
-  ent_weight: 0.02        # 在 y_soft 上做熵正则，鼓励多样使用
+  ent_weight: 0.08        # 在 y_soft 上做熵正则，鼓励多样使用
+  balance_weight: 0.02    # 批级均衡正则：把平均分布拉向均匀，缓解马太效应
+  # 0319: 为探索相关项加入“后期退火”调度（避免长期过均匀导致聚类弱、收敛慢）
+  ent_schedule:
+    start_step: 300000
+    duration: 100000
+    end_weight: 0.06
+  balance_schedule:
+    start_step: 300000
+    duration: 100000
+    end_weight: 0.005
   # Teacher 改为对齐到 z_gt 的监督；蒸馏相关默认关闭，避免主导损失
   teacher_align_weight: 0.1
   vq_teacher_weight: 0.0
@@ -70,19 +80,35 @@ scheduler:
 
 router:
   distance_temperature: 0.5   # p_nn 的温度（越小越尖锐）
-  teacher_temperature: 1.0    # 几何教师分布温度（teacher_z/z_gt 到 code 的软分布）
+  teacher_temperature: 3.0    # 几何教师分布温度（更平，以利探索）
+  # 0319: 教师温度退火（高→低），早期鼓励探索，后期促进入簇专化
+  teacher_temperature_start: 3.0
+  teacher_temperature_end: 2.8
+  teacher_temp_decay_start: 200000
+  teacher_temp_decay_steps: 200000
   gumbel_tau_start: 1.0       # p_r 的初始 Gumbel-Softmax 温度
-  gumbel_tau_end: 0.2         # p_r 的最终温度
+  gumbel_tau_end: 0.6         # p_r 的最终温度（略平）
   beta_start: 0.0             # 融合权重起始（更信教师）
-  beta_end: 0.7               # 融合权重终值（逐步信路由）
+  beta_end: 0.5               # 融合权重终值（不过早完全依赖路由）
   warmup_steps: 50000         # 从 start 线性过渡到 end 的步数
   topk: 4                     # 融合后 Top-K 选通，1 表示 Top-1
-  topk_warmup_steps: 50000    # 早期不稀疏（使用期望向量），提升码本使用度
+  topk_warmup_steps: 200000   # 显著推迟稀疏化，先把使用度拉起来
+  # 0319: 晚期将 β 提升到更高，逐步更信路由器
+  beta_boost:
+    start_step: 350000
+    duration: 150000
+    end_beta: 0.65
+  # 0319: Top‑K 分段调度（期望→Top‑4→Top‑1），帮助进入专化
+  topk_schedule:
+    stage1_until: 200000
+    stage2_until: 400000
+    stage2_k: 4
+    final_k: 1
   # 训练后期轻微升温 tau_r，提升码本使用度（可选）
   tau_r_boost:
-    start_step: 400000        # 在该步之后开始由 tau_end -> end_tau 的线性过渡
+    start_step: 200000        # 提前启动后期软化
     duration: 100000          # 过渡步数
-    end_tau: 0.30             # 最终温度，略高于 0.2 即可
+    end_tau: 0.60             # 更平的最终温度
 
 teacher:
   enabled: true

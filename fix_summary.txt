@@ -68,3 +68,194 @@
 
 后续可选：
 - 如需支持全分子 3D 属性（QM），可并行新增“motif‑level 3D 交互”的教师辅助分支及对应损失，不进入 z_gt 对齐路径，以免语义错位。
+
+0317:
+
+
+0317-hotfix:
+问题表现（仍基于本轮曲线，已应用 0317 的配置调优后依旧塌缩）：
+- effective_codes≈2–3、usage_unique_ratio≈0.03–0.06、top1_nn_hit≈1.0，y_soft_entropy≈0.19–0.22；
+- 说明融合后的 y_soft 极尖且被最近邻/教师主导，探索无效。
+
+根因（实现与设计意图不一致的两处“硬问题”）：
+1) Top‑K warmup 语义错误导致早期仍在硬化：
+   - 训练循环在 warmup 期调用 `model.set_topk(0)` 期望“禁用稀疏/硬化、用期望向量”；
+   - 但前向实现按 `if self.router_topk > 1: ... else: ...` 分支，`0` 会落到 Top‑1 路径，等价于硬化，
+     使长尾 code 在最需要探索的早期就被切断梯度通路 → 直接触发码本塌缩。
+2) 熵正则号位相反：
+   - 损失里定义 `ent = -∑ y_soft log y_soft`（即 H(y_soft)），随后以正权重加到总损失：`+ ent_weight * ent`；
+   - 最小化 `+H` 会降低熵、压尖分布，与“鼓励探索/增大熵”的目标相反；当 ent_weight 上调时反而加剧塌缩。
+
+本次修改（代码层面，最小化修复）：
+1) 正确实现 warmup=soft 期望向量
+   - 文件：momo/models/gin_motif_vqmoe.py
+   - 约定更新：
+     - `router_topk == 0`：禁用稀疏与硬化，直接使用 y_soft 期望（仅记录 topk_idx 作监控）。
+     - `router_topk == 1`：Top‑1 ST 硬化。
+     - `router_topk  > 1`：Top‑K 稀疏 + ST。
+   - 同步更新 `set_topk` 注释与行为（接受 0/1/K）。
+
+2) 熵正则方向修正为“鼓励更高熵”
+   - 文件：momo/train/losses.py
+   - 将总损失组合从 `... + ent_weight * ent` 改为 `... - ent_weight * ent`，保持 ent 定义为正的 H(p)。
+
+配置影响：
+- 现有 configs/pretrain_pcqm4mv2.yaml 无需改动；`ent_weight: 0.08` 现已按预期“增大熵”。
+- `topk_warmup_steps` 的 warmup 期现在确实使用软分布，不再误硬化。
+
+预期指标变化：
+- 早期 1–2e5 步：effective_codes/usage_unique_ratio 上升，top1_nn_hit < 0.95，y_soft_entropy 提升；
+- 进入稀疏化后（>2e5 步）：有效代码数维持在 16–32；balance 下降，KL_to_teacher 进一步收敛，训/验间隙缩小。
+
+回归项/注意事项：
+- 若 5–8 万步后 effective_codes 仍 <8，可临时把 `loss.ent_weight` 提到 0.10 或把 `router.beta_end` 降到 0.4；
+- 若出现“过均匀”导致拟合变慢，可把 `loss.balance_weight` 降至 0.01 或在 30 万步后线性衰减。
+问题表现（基于新一轮预训练 2- 系列曲线）:
+- router/effective_codes≈2、usage_unique_ratio≈0.03~0.06、y_soft_entropy≈0.015，码本明显塌缩；
+- top1_nn_hit≈0.98~1.0，选择几乎被最近邻主导；
+- train/kl≈0.33、val/kl≈0.49，路由分布与教师分布一致性偏低且存在泛化间隙；
+- teacher_align 已回到正常量级，但未触发蒸馏升温；总体 loss 已不被教师项主导。
+
+根因（进一步归纳）:
+- 融合与温度配置导致 y_soft 过尖：beta_end=0.7 + tau_r_end=0.2 + 较低的 teacher_temperature 共同放大了“赢家通吃”；
+- Top‑K 稀疏化启用过早（5万步），在分布尚未拉平时切断长尾 code 的梯度通路；
+- commit 绑定上升较快（5万步达满值），早期将 h_2d 强拉向少数 e_k，放大早期偏置；
+- 熵正则权重偏小，难以有效对抗塌缩；
+- 缺少显式的“负载均衡”约束，存在 MoE 马太效应风险。
+
+本次修复（配置与轻量正则，避免再引入强监督）:
+1) 提升探索与软化分布（configs/pretrain_pcqm4mv2.yaml）
+   - teacher_temperature: 1.0 → 3.0；
+   - gumbel_tau_end: 0.2 → 0.5，并新增 tau_r_boost 在 20万步后过渡到 0.6；
+   - beta_end: 0.7 → 0.5，减弱对 p_r 的过早依赖；
+   - topk_warmup_steps: 5万 → 20万，先用期望向量、后稀疏；
+   - ent_weight: 0.02 → 0.08，显著增强熵正则；
+   - commit_weight: 0.25 → 0.15，commit_ramp_steps: 5万 → 12万，放缓早期绑定。
+
+2) 防马太效应的轻量“均衡正则”（momo/train/losses.py, pretrain 记录）
+   - 新增 balance_weight（默认 0.02）：对 batch 平均分布 p_bar 做 L2 到均匀分布的拉近，鼓励代码使用更均匀；
+   - 训练/验证新增 balance 指标写入，便于观测均衡约束是否生效。
+
+3) 监控与打印完善（momo/train/pretrain.py）
+   - 记录 train/router/balance 与 val/balance；step 打印包含 balance。
+
+预期变化：
+- usage_unique_ratio 明显上升，effective_codes 逐步增长到 16–32 区间；
+- y_soft_entropy 提升（>0.03），top1_nn_hit 不再长期≈1；
+- train/kl 与 val/kl 收敛且间隙缩小；
+- recon 稳定下降，commit 平滑升温；总体 loss 不被任何单项主导。
+
+后续观察与开关：
+- 若 5–8 万步后 effective_codes 仍 <8，可临时把 ent_weight 提高到 0.1 或把 beta_end 再降到 0.4；
+- 如出现“过均匀”导致拟合变慢，可把 balance_weight 降至 0.01 或在 30万步后线性衰减；
+ - 暂不启用硬容量/强均衡（Switch/GShard 风格），待分布恢复后再评估是否需要。
+
+0319:
+
+根因（针对当前曲线的新问题）：
+- 过度探索与均衡：较高的 teacher_temperature、较大的 ent_weight 与 balance_weight、超长的 Top‑K 延迟共同导致 y_soft 长期偏平，码本难以形成清晰簇；effective_codes 远超预期带宽（>32），val/vq 与 val/recon 降不下去。
+- 专化阶段启动偏晚：β 终值较低（0.5）且无后期提升，模型在融合分布上始终“更信教师分布”，路由器难以主导形成稳定选码；Top‑K 一步到位，缺乏从软到硬的过渡。
+
+本次改动（根源修复）：
+1) 探索项“后期退火”（momo/train/pretrain.py, configs/pretrain_pcqm4mv2.yaml）
+   - 为熵正则与均衡正则新增线性调度：在 300k→400k 步将 ent_weight: 0.08→0.02，balance_weight: 0.02→0.0；
+   - 通过 current_weights() 动态应用，训练早期保探索，后期收敛到专化。
+2) 教师分布降温 + 路由权重晚期提升（同上）
+   - 新增教师温度退火：teacher_temperature 3.0 在 100k→200k 线性降至 2.0（模型新增 set_teacher_temperature）；
+   - 新增 β 晚期提升：在 300k→400k 将 β 进一步从当时值升到 0.8，使路由器逐步主导决策。
+3) Top‑K 分段调度（同上）
+   - 可选 topk_schedule：期望向量(0) 直至 100k → Top‑4 至 150k → Top‑1 之后；避免骤然硬化，同时更快进入专化。
+
+配置变更：configs/pretrain_pcqm4mv2.yaml
+- 新增 loss.ent_schedule / loss.balance_schedule；
+- 新增 router.teacher_temperature_{start,end} 与 teacher_temp_{decay_start,decay_steps}；
+- 新增 router.beta_boost 与 router.topk_schedule（兼容旧逻辑，均为可选）。
+
+代码变更：
+- momo/train/pretrain.py：实现上述权重/温度/β/Top‑K 的调度逻辑；
+- momo/models/gin_motif_vqmoe.py：新增 set_teacher_temperature() 以便训练循环动态调整。
+
+预期效果：
+- 码本使用度回落到健康区间（effective_codes ≈16–32），y_soft_entropy 适中；
+- val/vq 与 val/recon 稳定下降，teacher_align 不再升高，训练后期整体 loss 由重构/VQ 主导；
+- Top‑K 命中率与使用唯一率保持合理，train/val 的 KL 曲线间隙缩小，收敛更平滑。
+
+
+0324:
+
+错误现象（基于本次紫色曲线对比上一版黄色）：
+- 训练中后期（≈300k 以后）y_soft_entropy 快速跌至近 0；train/router/effective_codes 从 50–80 断崖到接近 1；train/router/usage_unique_ratio 贴近 0；train/router/balance 接近 1（极端不均衡）。
+- train/router/top1_nn_hit 长期≈1，train/router/kl_to_teacher 接近 0（在极尖分布上“对齐”），但验证侧 val/recon 与 val/vq 反而上升，val/loss 明显劣化。
+- teacher_align 在新跑中虽更低，但整体收敛被“路由+码本塌缩”主导，未体现到验证指标上。
+
+根因（结构性不稳定）：
+- 乘积专家放大效应：决策分布采用乘积融合 y_soft ∝ p_r^β · p_t^(1−β)（momo/models/gin_motif_vqmoe.py），任一路径变尖都会把整体放大得更尖；
+  与 Top‑K/Top‑1 硬化叠加后形成“赢家通吃”的正反馈。
+- 多个强力机制在同一训练窗口同向叠加：Top‑K 提前硬化到 Top‑1、β 后期提升到 0.8、teacher 温度从 3.0→2.0 降温、commit 提前升满，这些共同把 y_soft 推向近 one‑hot。
+- 调度为开环基于步数，且均衡/熵项在后期退到极低，缺乏“状态闭环”制动，导致从“过均匀”直接翻到“塌缩”。
+
+本次修复（最小改法 + 闭环保险）：
+1) 决策去乘积（切断放大器）
+   - y_soft 由“乘积融合”改为“仅用路由分布 p_r 决策”；教师分布 p_t 仅用于 KL 正则与监控、以及码本 VQ 的聚类目标。
+   - 代码：momo/models/gin_motif_vqmoe.py（去除 p_r^β·p_t^(1−β) 的乘积作为决策，保留 p_t 的计算与路由信息输出）。
+2) 稀疏化放缓与分段过渡
+   - 延后 Top‑1：通过 router.topk_schedule 将 final_k=1 推迟到 ≥400k；在 200k→400k 维持 Top‑4 的软稀疏，避免骤然硬化。
+   - 配置：configs/pretrain_pcqm4mv2.yaml（更新 topk_schedule）。
+3) 降低晚期“硬化强度”
+   - β 晚期上限从 0.8 降至 0.6–0.65，并推迟提升起点到 ≥350k、拉长提升时长；
+   - teacher_temperature_end 从 2.0 提至 2.6，降温起点与时长后移（更温和）。
+   - 配置：router.beta_boost 与 router.teacher_temperature_{start,end,decay_*}。
+4) 探索与均衡保底
+   - loss.ent_schedule 的 end_weight 提升至 0.04；balance_schedule 的 end_weight 保留 0.005（不再退到 0）。
+5) 简单闭环保险丝（状态驱动，不再纯步数）
+   - 在训练循环内监控上一 step 的 y_soft_entropy 与 effective_codes：若熵<0.03 或有效码<16，则在后续短窗（例如 2k steps）自动切回 topk=0（软分布）、将 β 上限夹到 ≤0.6，并临时把 teacher_temperature 提高到 ≥2.8；写入标志 train/router/safeguard_active=1，恢复后回到调度轨道。
+   - 代码：momo/train/pretrain.py（在 set_topk/set_router_params 前应用闭环判断并写入监控）。
+
+预期效果（与判定标准）：
+- y_soft_entropy 稳定在 0.03–0.08；train/router/effective_codes 稳定在 16–32 区间；usage_unique_ratio > 0.15；balance 不再长期升高。
+- train/router/top1_nn_hit 不会在预训练中期长期≈1；KL(to teacher) 维持在中等水平（不再因极尖而“假性很低”）。
+- 验证侧：val/recon 与 val/vq 随训练稳步下降，loss 不再被单项主导；teacher_align 维持低位但不以牺牲码本使用为代价。
+
+兼容性与运行提示：
+- 由于决策路径变更（y_soft 不再乘积融合），旧 ckpt 不建议继续训练；建议从头预训练或仅复用码本初始值。
+- 若 5–8 万步后 effective_codes 仍 <8，可临时把 ent_weight 提至 0.06 或将 β 上限再降 0.05 观察；若过均匀导致收敛慢，再把 balance_end 调回 0.003–0.005。
+
+0325:
+
+现象（基于本次绿色曲线与 0324 对比）：
+- train/router/effective_codes 长期≈7，train/router/usage_unique_ratio≈0.07；train/router/safeguard_active 长时间为 1；
+- y_soft_entropy≈0.16（表面不尖），但 batch-mean 口径下有效码很低；
+- val/recon 与 val/vq 无明显持续下降，val/teacher_align 有抬头；train/commit≈2.5–3 相对偏重；
+- vq_teacher 走高，teacher_align ≈1.9–2.0 震荡，提示教师对齐不足但仍对路由产生牵引。
+
+根因（根因的根因）：
+- 未对齐教师被用于生成 p_t：模型始终以 teacher_z→p_t 监督路由；校准期 `kl_weight` 仍为非零，导致“未对齐教师分布 vs 以 z_gt 为目标的 VQ/commit”相互牵制；
+- 保险丝触发条件过敏感：判据为“y_soft_entropy<0.03 或 effective_codes<16（batch-mean e^{H(p_bar)}）”，在“少数码+软分布”时几乎常驻触发，训练长期被迫 soft（topk=0），难以进入专化；
+- 指标口径与权重结构放大问题：batch-mean 有效码口径对跨样本不均极敏感（系统性低估）；同时 KL/commit 相对更强，−ENT/balance 较弱，路由更易被锁到少数码。
+
+本次修复（根因修复，非曲线美化）：
+1) p_t 门控 + 校准期禁用 KL（momo/models/gin_motif_vqmoe.py, momo/train/pretrain.py）
+   - 模型新增 `set_use_teacher_for_pt()`，校准未完成时由训练循环关闭对 teacher_z 的依赖，使 p_t 回退到基于 z_gt；
+   - `current_weights()` 在校准期将 `kl_weight` 确认为 0，避免未对齐教师牵制路由。
+2) 保险丝由“或”改“且”，并加入滞后/提前释放（momo/train/pretrain.py）
+   - 触发条件：y_soft_entropy<0.05 且 样本级有效码均值(e^{H(p_i)})<8 连续5次，触发 2k 步软化；
+   - 保护窗口内连续5次“好样本”可提前释放；同时新增记录 `train/router/effective_codes_sample`。
+3) 轻度再平衡损失与温度（configs/pretrain_pcqm4mv2.yaml）
+   - commit_weight: 0.15→0.12，commit_ramp_steps: 120k→200k；
+   - kl_weight: 0.2→0.1；ent_schedule.end_weight: 0.04→0.06；
+   - teacher_temperature_end: 2.6→2.8；gumbel_tau_end: 0.5→0.6（路由更平滑）。
+
+代码变更：
+- momo/models/gin_motif_vqmoe.py：新增 teacher 门控开关 `use_teacher_for_pt` 与 `set_use_teacher_for_pt()`；在 forward 中按门控决定是否计算 teacher_z→p_t。
+- momo/train/pretrain.py：校准期 KL=0；训练循环按 `calib_active` 动态调用 `set_use_teacher_for_pt()`；保险丝逻辑改为 AND + 连续计数 + 提前释放，并新增样本级有效码指标。
+- configs/pretrain_pcqm4mv2.yaml：按上文调整 loss/router 若干项。
+
+预期效果：
+- 监督一致性提升：teacher_align 稳步下降且不再主导 loss；KL 不再早期牵制路由；
+- 使用度回到健康区间：effective_codes≈16–32；usage_unique_ratio>0.15；y_soft_entropy 0.03–0.08；保险丝不再长期点亮；
+- 验证侧稳定：val/recon 与 val/vq 逐步下降，loss 不被单项主导；整体收敛更平滑；
+- 早期可能略慢，但后期专化更稳，对下游微调更友好。
+
+兼容与运行提示：
+- 旧 ckpt 可继续用于初始化 codebook；建议新跑从头预训练以消除路由与教师门控变更带来的状态偏差；
+- 若 50k–80k 步后 `effective_codes_sample` 仍 <8，可短期把 `loss.ent_weight` 提至 0.08 观察；若过均匀致收敛慢，再把 `balance_schedule.end_weight` 回调到 0.003–0.005。
