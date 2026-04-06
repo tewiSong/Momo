@@ -1,109 +1,147 @@
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
 
 
 def compute_losses(
-    z_hat: torch.Tensor,
-    z_gt: torch.Tensor,
     h_motif_2d: torch.Tensor,
-    e_k: torch.Tensor,
+    router: Dict[str, torch.Tensor],
     weights: Dict[str, float],
-    router: Optional[Dict[str, torch.Tensor]] = None,
-    teacher_z: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
-    # 形状断言
-    assert z_hat.shape == z_gt.shape
-    assert h_motif_2d.size(0) == z_hat.size(0)
-    assert e_k.shape == z_hat.shape
+    # Fail fast: required router fields must exist for pretraining（几何主监督版）
+    assert isinstance(router, dict)
+    for k in ['logits_code', 'e_hat', 'h_motif_enh', 'z3d_gt', 'zgt_proj', 'z_pred', 'z_proto', 'codebook_codes', 'proto_topk_idx', 'h_motif_local', 'z_template']:
+        assert k in router, f'missing router field: {k}'
 
-    # 在 FP32 通道计算损失，避免 AMP 下的溢出
+    device = h_motif_2d.device
     with torch.cuda.amp.autocast(enabled=False):
-        z_hat_f = z_hat.float()
-        z_gt_f = z_gt.float()
-        h2d_f = h_motif_2d.float()
-        e_k_f = e_k.float()
+        logits_code = router['logits_code']
+        p_code = F.softmax(logits_code.float(), dim=-1)
 
-        recon = F.mse_loss(z_hat_f, z_gt_f)
-        vq = torch.mean(torch.sum((z_gt_f.detach() - e_k_f) ** 2, dim=-1))
-        commit = torch.mean(torch.sum((h2d_f - e_k_f.detach()) ** 2, dim=-1))
+        # Base accumulators
+        loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+        ent = torch.tensor(0.0, dtype=torch.float32, device=device)
+        balance = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-        loss = (
-            float(weights['recon_weight']) * recon
-            + float(weights['vq_weight']) * vq
-            + float(weights['commit_weight']) * commit
-        )
+        # 1) 几何重建：pred_geom = latent_to_zgt(h_motif_enh) 与 z3d_gt 的 MSE
+        pred_geom = router['z_pred'].float()
+        z3d_gt = router['z3d_gt'].float()
+        recon = F.mse_loss(pred_geom, z3d_gt)
+        loss = loss + float(weights.get('recon_weight', 0.0)) * recon
 
-    # 额外的路由相关损失（可选，由 cfg 权重控制，不硬编码）
-        kl = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
-        ce = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
-        ent = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
-        balance = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
-        if router is not None:
-            # 将监督与正则统一到“真正用于选码”的分布 y_soft
-            y_soft = router.get('y_soft')
-            p_t = router.get('p_t')  # 教师/几何分布（teacher_z 或 z_gt 生成）
-            logits = router.get('logits')
-            teacher_nn_index = router.get('teacher_nn_index')
-            eps = 1e-8
-            if y_soft is not None and p_t is not None:
-                ys = torch.clamp(y_soft.float(), min=eps)
-                pt = torch.clamp(p_t.float(), min=eps)
-                # 双向 KL：匹配 y_soft 与教师分布
-                kl1 = torch.sum(pt * (torch.log(pt) - torch.log(ys)), dim=-1).mean()
-                kl2 = torch.sum(ys * (torch.log(ys) - torch.log(pt)), dim=-1).mean()
-                kl = kl1 + kl2
-                # 直接在 y_soft 上做熵正则，鼓励使用更多 code
-                ent = -torch.sum(ys * torch.log(ys), dim=-1).mean()
-                # 轻量级“负载均衡”：将批内平均分布拉向均匀分布，缓解马太效应
-                # p_bar: [K]
-                p_bar = ys.mean(dim=0)
-                K = p_bar.numel()
-                uniform = torch.full_like(p_bar, 1.0 / float(max(1, K)))
-                balance = torch.sum((p_bar - uniform) ** 2)
-            # 可选：还保留一个与教师最近邻的 CE 监督（默认权重为 0）
-            if logits is not None and teacher_nn_index is not None:
-                ce = F.cross_entropy(logits.float(), teacher_nn_index.long())
+        # 1.1) 原型聚合（模板监督，latent 空间）：直接让 e_hat 贴近 z_template
+        z_proto = router['z_proto'].float()  # 仅用于监控，不参与该项损失
+        e_hat = router['e_hat'].float()
+        z_template_lat = router['z_template'].float().detach()
+        proto_recon = F.mse_loss(e_hat, z_template_lat)
+        loss = loss + float(weights.get('proto_recon_weight', 0.0)) * proto_recon
 
-            kl_w = float(weights.get('kl_weight', 0.0))
-            ce_w = float(weights.get('ce_weight', 0.0))
-            ent_w = float(weights.get('ent_weight', 0.0))
-            bal_w = float(weights.get('balance_weight', 0.0))
-            # 注意：为了“鼓励更高的熵”，应最小化 -H(p)。保持 ent 为正的 H(p)，在总损失中以负号加入
-            loss = loss + kl_w * kl + ce_w * ce - ent_w * ent + bal_w * balance
+        # 2) VQ / Commit（基于模板监督）：
+        #    - vq: 使被选原型靠近 z_template（stop-grad on z_template）
+        #    - commit: 使 h_motif_2d 靠近前向选中的原型（stop-grad on code）
+        vq_w = float(weights.get('vq_weight', 0.0))
+        commit_w = float(weights.get('commit_weight', 0.0))
+        codes = router['codebook_codes'].float()
+        # e_target（模板最近原型 Top‑1）
+        if vq_w > 0.0:
+            assert 'gt_nn_index' in router, 'vq_weight>0 requires gt_nn_index'
+            e_target = codes.index_select(0, router['gt_nn_index'].long())
+            z_template = router['z_template'].float().detach()
+            vq = torch.mean((e_target - z_template) ** 2)
+        else:
+            vq = torch.tensor(0.0, dtype=torch.float32, device=device)
+        loss = loss + vq_w * vq
+        # e_selected（路由 Top‑1 原型，用于 commit，对齐无上下文局部表示）
+        if commit_w > 0.0:
+            idx_top1 = router['proto_topk_idx'][:, 0].long()
+            e_selected = codes.index_select(0, idx_top1)
+            commit = torch.mean((router['h_motif_local'].float() - e_selected.detach()) ** 2)
+        else:
+            commit = torch.tensor(0.0, dtype=torch.float32, device=device)
+        loss = loss + commit_w * commit
 
-        # Teacher 相关损失（显式权重控制）
-        vq_teacher = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
-        recon_teacher = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
-        teacher_align = torch.tensor(0.0, dtype=torch.float32, device=z_hat.device)
-        if teacher_z is not None:
-            tz = teacher_z.float()
-            # 1) 对齐：显式将 teacher 映射到与 z_gt 同一语义/尺度空间
-            #    该项允许反传到 teacher（或仅到投影层，取决于参数 requires_grad）。
-            teacher_align = F.mse_loss(tz, z_gt_f)
-            ta_w = float(weights.get('teacher_align_weight', 0.0))
-            loss = loss + ta_w * teacher_align
+        # 3) 原型路由监督：KL(p_gt || p_code) 与 CE(k_gt)
+        kl = torch.tensor(0.0, dtype=torch.float32, device=device)
+        ce = torch.tensor(0.0, dtype=torch.float32, device=device)
+        kl_w = float(weights.get('kl_weight', 0.0))
+        ce_w = float(weights.get('ce_weight', 0.0))
+        if kl_w > 0.0:
+            assert 'p_gt' in router, 'kl_weight>0 requires p_gt in router'
+            pt = torch.clamp(router['p_gt'].float().detach(), min=1e-12)
+            pc = torch.clamp(p_code, min=1e-12)
+            kl = torch.sum(pt * (torch.log(pt) - torch.log(pc)), dim=-1).mean()
+            loss = loss + kl_w * kl
+        if ce_w > 0.0:
+            assert 'gt_nn_index' in router, 'ce_weight>0 requires gt_nn_index in router'
+            ce = F.cross_entropy(logits_code.float(), router['gt_nn_index'].long())
+            loss = loss + ce_w * ce
 
-            # 2) 可选蒸馏/引导：保持历史字段，但默认配置将权重置为 0。
-            #    - vq_teacher 仅拉动 codebook，避免 teacher 不稳时误导学生。
-            #    - recon_teacher 采用 detach，避免该项更新 teacher。
-            vq_teacher = torch.mean(torch.sum((tz.detach() - e_k_f) ** 2, dim=-1))
-            recon_teacher = F.mse_loss(z_hat_f, tz.detach())
-            vqt_w = float(weights.get('vq_teacher_weight', 0.0))
-            rct_w = float(weights.get('recon_teacher_weight', 0.0))
-            loss = loss + vqt_w * vq_teacher + rct_w * recon_teacher
+        # 3.1) Δ 仅补差：让 z_pred 与 z_proto 的差分对齐到 (z3d_gt - z_proto)
+        delta_res = torch.tensor(0.0, dtype=torch.float32, device=device)
+        dr_w = float(weights.get('delta_res_weight', 0.0))
+        if dr_w > 0.0:
+            delta_res = F.mse_loss((pred_geom - z_proto), (z3d_gt - z_proto).detach())
+            loss = loss + dr_w * delta_res
+
+        # 3.2) Δ 正交约束：抑制 Δ 与 e_hat 共线（弱约束）
+        orth = torch.tensor(0.0, dtype=torch.float32, device=device)
+        ow = float(weights.get('orth_weight', 0.0))
+        if ow > 0.0:
+            d = router.get('delta', torch.zeros_like(router['e_hat']).float()).float()
+            eh = router['e_hat'].float()
+            d_n = F.normalize(d, dim=-1)
+            eh_n = F.normalize(eh, dim=-1)
+            cos2 = (d_n * eh_n).sum(dim=-1) ** 2
+            orth = cos2.mean()
+            loss = loss + ow * orth
+
+        # 4) Expert load balancing (batch mean vs uniform)
+        exp_balance = torch.tensor(0.0, dtype=torch.float32, device=device)
+        eb_w = float(weights.get('exp_balance_weight', 0.0))
+        if eb_w > 0.0:
+            assert 'p_exp' in router, 'exp_balance_weight>0 requires p_exp in router'
+            p_bar = router['p_exp'].float().mean(dim=0)
+            M = int(p_bar.numel())
+            uniform = torch.full_like(p_bar, 1.0 / float(M))
+            exp_balance = torch.sum((p_bar - uniform) ** 2)
+            loss = loss + eb_w * exp_balance
+
+        # 5) Δ capacity regularization
+        delta_l2 = torch.tensor(0.0, dtype=torch.float32, device=device)
+        d_w = float(weights.get('delta_l2_weight', 0.0))
+        if d_w > 0.0:
+            assert 'delta' in router, 'delta_l2_weight>0 requires delta in router'
+            d = router['delta'].float()
+            delta_l2 = torch.mean(torch.sum(d * d, dim=-1))
+            loss = loss + d_w * delta_l2
+
+        # 6) Prototype-side entropy and batch-balance
+        p_code = F.softmax(logits_code.float(), dim=-1)
+        ent = torch.sum(-p_code * torch.log(torch.clamp(p_code, min=1e-12)), dim=-1).mean()
+        ent_w = float(weights.get('ent_weight', 0.0))
+        if ent_w != 0.0:
+            loss = loss + ent_w * (-ent)
+        p_bar = p_code.mean(dim=0)
+        K = int(p_bar.numel())
+        uniform = torch.full_like(p_bar, 1.0 / float(K))
+        balance = torch.sum((p_bar - uniform) ** 2)
+        bal_w = float(weights.get('balance_weight', 0.0))
+        loss = loss + bal_w * balance
 
     return {
         'loss': loss,
         'recon': recon,
+        'proto_recon': proto_recon,
+        'delta_res': delta_res,
+        'orth': orth,
         'vq': vq,
         'commit': commit,
         'kl': kl,
         'ce': ce,
         'ent': ent,
         'balance': balance,
-        'vq_teacher': vq_teacher,
-        'recon_teacher': recon_teacher,
-        'teacher_align': teacher_align,
+        'exp_balance': exp_balance,
+        'delta_l2': delta_l2,
+        'geom_align': recon,
     }

@@ -4,7 +4,7 @@
 #SBATCH -J pretrain-pcqm4mv2
 #SBATCH -o pretrain-pcqm4mv2.%J.out
 #SBATCH -e pretrain-pcqm4mv2.%J.err
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --mem=250G
 #SBATCH --constraint=v100|a100

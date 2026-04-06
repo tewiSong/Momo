@@ -1,3 +1,4 @@
+# momo/train/pretrain.py
 import os
 import argparse
 from typing import Dict, Optional
@@ -12,6 +13,7 @@ from momo.utils.config import load_yaml
 from momo.data.pcqm4mv2 import PCQM4Mv2MotifDataset
 from momo.models.gin_motif_vqmoe import MotifVQMoE
 from momo.train.losses import compute_losses
+import torch.nn.functional as F
 
 
 def setup_seed(seed: int) -> None:
@@ -110,18 +112,13 @@ def eval_epoch(model: torch.nn.Module,
                loss_cfg: Dict[str, float]) -> Dict[str, float]:
     model.eval()
     tot = 0
-    sums = {k: 0.0 for k in ['loss', 'recon', 'vq', 'commit', 'kl', 'ce', 'ent', 'balance', 'vq_teacher', 'recon_teacher', 'teacher_align']}
+    sums = {k: 0.0 for k in ['loss', 'recon', 'proto_recon', 'delta_res', 'orth', 'vq', 'commit', 'kl', 'ce', 'ent', 'balance', 'geom_align', 'exp_balance', 'delta_l2']}
     with torch.no_grad():
         for batch in dl:
             batch = batch.to(device)
-            z_hat, h_motif, e_k, logits, topk, router_info = model(batch)
-            z_gt = batch.motif_target
-            out = compute_losses(
-                z_hat=z_hat, z_gt=z_gt, h_motif_2d=h_motif, e_k=e_k, weights=loss_cfg,
-                router=router_info,
-                teacher_z=router_info.get('teacher_z') if router_info is not None else None
-            )
-            bs = z_hat.size(0)
+            h_motif_2d, h_motif_enh, router_info = model(batch)
+            out = compute_losses(h_motif_2d=h_motif_2d, router=router_info, weights=loss_cfg)
+            bs = h_motif_2d.size(0)
             tot += bs
             for k in sums.keys():
                 sums[k] += float(out[k].detach().cpu()) * bs
@@ -165,11 +162,14 @@ def main():
     # Dataset and split
     ds = PCQM4Mv2MotifDataset(
         preprocessed_path=cfg['dataset']['preprocessed_path'],
-        z3d_dim=cfg['model']['z3d_dim'],
+        z3d_dim=cfg['model']['geom_dim'],
         max_atomic_num=cfg['dataset']['max_atomic_num'],
         require_pos=bool(cfg.get('teacher', {}).get('enabled', False)),
     )
     print(f"Loaded dataset from {cfg['dataset']['preprocessed_path']} with {len(ds)} molecules")
+    assert int(ds.z3d_dim) == int(cfg['model']['geom_dim']), (
+        f"geom_dim mismatch: dataset={int(ds.z3d_dim)} vs cfg.model.geom_dim={int(cfg['model']['geom_dim'])}"
+    )
 
     val_ratio = float(cfg['dataset'].get('val_ratio', 0.05))
     n_total = len(ds)
@@ -191,37 +191,12 @@ def main():
         num_workers=cfg['dataset']['num_workers'],
     )
 
-    # Model & optim (optionally initialize codebook by k-means on z3d)
+    # Model & optim（codebook 初始化参数仅记录，实际在模型构建后执行）
     init_cfg = cfg['model'].get('codebook_init', {})
     init_name = str(init_cfg.get('name', 'random')).lower()
     kmeans_centroids = None
-    if init_name == 'kmeans':
-        sample_size = int(init_cfg.get('sample_size', 200000))
-        max_iters = int(init_cfg.get('max_iters', 30))
-        tol = float(init_cfg.get('tol', 1e-4))
-        seed = int(cfg['misc'].get('seed', 42))
-        print(f"[Init] Collecting up to {sample_size} z3d samples for k-means...")
-        X = _reservoir_sample_z3d(ds, sample_size, int(cfg['model']['z3d_dim']), seed)
-        K = int(cfg['model']['codebook_size'])
-        N_eff = X.size(0)
-        print(f"[Init] Running k-means on {N_eff} samples into {K} clusters (iters={max_iters}, tol={tol})")
-        kmeans_centroids = _kmeans_torch(X, K=K, max_iters=max_iters, tol=tol, seed=seed)
-        # Optional: compute inertia for logging
-        with torch.no_grad():
-            batch = 8192
-            sse = 0.0
-            for i in range(0, N_eff, batch):
-                xb = X[i:i+batch]
-                x2 = (xb * xb).sum(dim=1, keepdim=True)
-                c2 = (kmeans_centroids * kmeans_centroids).sum(dim=1).view(1, -1)
-                d2 = x2 + c2 - 2.0 * xb.matmul(kmeans_centroids.t())
-                sse += float(d2.min(dim=1).values.sum().item())
-        print(f"[Init] k-means inertia (sum of squared distances): {sse:.4f}")
 
     model = MotifVQMoE(cfg).to(device)
-    # 将数据的 z3d 归一化参数注入模型，用于对齐 teacher 输出空间
-    with torch.no_grad():
-        model.set_z3d_norm(ds.z3d_mean.to(model.codebook.codes.device), ds.z3d_std.to(model.codebook.codes.device))
     # 冻结/解冻 teacher 参数：从根源修复需先把 teacher 约束到 z_gt，同期避免其不稳定牵动主干
     tcfg = cfg.get('teacher', {})
     trainable = bool(tcfg.get('trainable', False))
@@ -232,11 +207,35 @@ def main():
     if hasattr(model, 'teacher_proj') and model.teacher_proj is not None:
         for p in model.teacher_proj.parameters():
             p.requires_grad = proj_trainable
-    if kmeans_centroids is not None:
-        assert kmeans_centroids.shape == model.codebook.codes.data.shape
+    # Codebook 初始化（基于几何投影到 latent 的 k-means）
+    if init_name == 'kmeans':
+        sample_size = int(init_cfg.get('sample_size', 200000))
+        max_iters = int(init_cfg.get('max_iters', 30))
+        tol = float(init_cfg.get('tol', 1e-4))
+        seed = int(cfg['misc'].get('seed', 42))
+        print(f"[Init] Collecting up to {sample_size} z3d_gt samples for k-means (projected to latent)...")
+        X = _reservoir_sample_z3d(ds, sample_size, int(ds.z3d_dim), seed)  # [N, geom_dim]
         with torch.no_grad():
+            Z = model.zgt_to_latent(X.to(device)).detach().cpu().to(torch.float32)
+        K = int(cfg['model']['codebook_size'])
+        N_eff = Z.size(0)
+        print(f"[Init] Running k-means on {N_eff} projected samples into {K} clusters (iters={max_iters}, tol={tol})")
+        kmeans_centroids = _kmeans_torch(Z, K=K, max_iters=max_iters, tol=tol, seed=seed)
+        with torch.no_grad():
+            assert kmeans_centroids.shape == model.codebook.codes.data.shape
             model.codebook.codes.data.copy_(kmeans_centroids.to(model.codebook.codes.data.dtype))
-        print("[Init] Codebook initialized from k-means centroids.")
+        # Optional inertia
+        with torch.no_grad():
+            batch = 8192
+            sse = 0.0
+            for i in range(0, N_eff, batch):
+                zb = Z[i:i+batch]
+                z2 = (zb * zb).sum(dim=1, keepdim=True)
+                c2 = (kmeans_centroids * kmeans_centroids).sum(dim=1).view(1, -1)
+                d2 = z2 + c2 - 2.0 * zb.matmul(kmeans_centroids.t())
+                sse += float(d2.min(dim=1).values.sum().item())
+        print(f"[Init] k-means inertia (projected): {sse:.4f}")
+        print("[Init] Codebook initialized from k-means centroids (projected).")
     optim = torch.optim.Adam(model.parameters(), lr=float(cfg['optim']['lr']))
 
     # Scheduler
@@ -270,29 +269,11 @@ def main():
     log_every = int(cfg['misc'].get('log_every_steps', 50))
     eval_every = int(cfg['misc'].get('eval_every_epochs', 1))
     eval_every_steps = int(cfg['misc'].get('eval_every_steps', 0))  # 0 表示按 epoch 评估
+    # 两阶段训练：前期冻结 Δ（严格要求在配置中提供步数）
+    delta_freeze_steps = int(cfg['model']['delta_freeze_steps'])
 
-    # Teacher 自动权重调度（align_gate 或 linear）
+    # 基本权重与简化调度（仅保留 commit 升温与熵/均衡后期退火）
     loss_base = dict(cfg['loss'])
-    ta_auto = dict(cfg['loss'].get('teacher_auto', {}))
-    ta_mode = str(ta_auto.get('mode', 'align_gate')).lower()
-    ta_threshold = float(ta_auto.get('align_threshold', 0.25))
-    ta_patience = int(ta_auto.get('patience', 3))
-    ta_ramp = int(ta_auto.get('ramp_steps', 100000))
-    ta_start_after = int(ta_auto.get('start_after_step', 50000))
-    ta_vq_max = float(ta_auto.get('vq_max', 0.1))
-    ta_recon_max = float(ta_auto.get('recon_max', 0.05))
-    ta_gate_hits = 0
-    ta_triggered = False
-    ta_ramp_start = -1
-
-    # Stage A：仅校准 teacher_proj 与 z_gt 的对齐，其它损失全部关闭
-    calib_enabled = bool(cfg.get('teacher', {}).get('enabled', False)) and bool(cfg.get('teacher', {}).get('proj_trainable', True))
-    calib_active = calib_enabled
-    calib_hits = 0
-    calib_min_steps = int(ta_auto.get('start_after_step', 50000))
-    calib_threshold = float(ta_auto.get('align_threshold', 0.25))
-    calib_patience = int(ta_auto.get('patience', 3))
-
     # commit 权重线性升温步数（避免早期强绑定码本）
     commit_ramp_steps = int(cfg.get('loss', {}).get('commit_ramp_steps', 50000))
 
@@ -314,60 +295,16 @@ def main():
 
     def current_weights(step: int):
         w = dict(loss_base)
-        vq_w, rc_w = 0.0, 0.0
-        # 校准阶段不再硬关主损失：保留主任务，蒸馏项仍为 0
-        if calib_active:
-            # 主任务保持开启
-            w['recon_weight'] = float(loss_base.get('recon_weight', 1.0))
-            w['vq_weight'] = float(loss_base.get('vq_weight', 1.0))
-            # commit 在校准期也按预设线性升温，避免早期强绑定
-            if commit_ramp_steps > 0:
-                p_commit = min(1.0, float(step) / float(commit_ramp_steps))
-                w['commit_weight'] = float(loss_base.get('commit_weight', 0.0)) * p_commit
-            else:
-                w['commit_weight'] = float(loss_base.get('commit_weight', 0.0))
-            # 校准阶段：关闭 KL（避免未对齐教师牵制 y_soft）
-            w['kl_weight'] = 0.0
-            w['ce_weight'] = float(loss_base.get('ce_weight', 0.0))
-            # 对探索相关权重增加“后期退火”调度
-            ent_base = float(loss_base.get('ent_weight', 0.0))
-            bal_base = float(loss_base.get('balance_weight', 0.0))
-            w['ent_weight'] = _apply_weight_schedule(
-                ent_base, cfg['loss'].get('ent_schedule', {}), step
-            )
-            w['balance_weight'] = _apply_weight_schedule(
-                bal_base, cfg['loss'].get('balance_schedule', {}), step
-            )
-            w['vq_teacher_weight'] = 0.0
-            w['recon_teacher_weight'] = 0.0
-            return w, vq_w, rc_w
-        if ta_mode == 'align_gate' and ta_triggered:
-            if ta_ramp > 0:
-                p = min(1.0, max(0.0, float(step - ta_ramp_start) / float(ta_ramp)))
-            else:
-                p = 1.0
-            vq_w = ta_vq_max * p
-            rc_w = ta_recon_max * p
-        elif ta_mode == 'linear':
-            start = int(ta_auto.get('start_step', 100000))
-            dur = int(ta_auto.get('duration', 100000))
-            if step >= start:
-                p = min(1.0, max(0.0, float(step - start) / float(max(1, dur))))
-                vq_w = ta_vq_max * p
-                rc_w = ta_recon_max * p
-        # commit 权重升温（仅在非校准阶段）
+        # commit 权重升温
         if commit_ramp_steps > 0:
             p_commit = min(1.0, float(step) / float(commit_ramp_steps))
             w['commit_weight'] = float(loss_base.get('commit_weight', 0.0)) * p_commit
-        # teacher 蒸馏两项（若启用）
-        w['vq_teacher_weight'] = float(vq_w)
-        w['recon_teacher_weight'] = float(rc_w)
-        # 后期退火：熵与均衡
+        # 熵/均衡后期退火
         ent_base = float(loss_base.get('ent_weight', 0.0))
         bal_base = float(loss_base.get('balance_weight', 0.0))
         w['ent_weight'] = _apply_weight_schedule(ent_base, cfg['loss'].get('ent_schedule', {}), step)
         w['balance_weight'] = _apply_weight_schedule(bal_base, cfg['loss'].get('balance_schedule', {}), step)
-        return w, vq_w, rc_w
+        return w
 
     # 路由调度参数（必须配置，不做静默回退）
     rcfg = cfg.get('router', None)
@@ -378,7 +315,7 @@ def main():
     beta_end = float(rcfg['beta_end'])
     warmup_steps = int(rcfg['warmup_steps'])
     topk_warmup_steps = int(rcfg.get('topk_warmup_steps', 0))
-    # 可选：教师温度退火（高→低），以及晚期将 β 提升到更大值
+    # 可选：教师温度退火（高→低），以及晚期将 β 提升到更大值（保留，但不强制要求 teacher）
     tt_start = float(rcfg.get('teacher_temperature_start', rcfg.get('teacher_temperature', 1.0)))
     tt_end = float(rcfg.get('teacher_temperature_end', tt_start))
     tt_decay_start = int(rcfg.get('teacher_temp_decay_start', -1))
@@ -393,6 +330,27 @@ def main():
     boost_start = int(boost_cfg.get('start_step', -1)) if isinstance(boost_cfg, dict) else -1
     boost_dur = int(boost_cfg.get('duration', 0)) if isinstance(boost_cfg, dict) else 0
     boost_end_tau = float(boost_cfg.get('end_tau', tau_r_end)) if isinstance(boost_cfg, dict) else tau_r_end
+
+    # Prototype Top‑K 调度（仅保留 ST 硬/软混合，前向只用被选 codes）
+    proto_sched = rcfg.get('topk_schedule', None)
+    if isinstance(proto_sched, dict):
+        stage1_until = int(proto_sched.get('stage1_until', -1))
+        stage2_until = int(proto_sched.get('stage2_until', -1))
+        stage2_k = int(proto_sched.get('stage2_k', rcfg.get('topk', 1)))
+        final_k = int(proto_sched.get('final_k', 1))
+        assert stage2_k >= 1 and final_k >= 1, 'proto top-k must be >=1'
+    else:
+        stage1_until = -1
+        stage2_until = -1
+        stage2_k = int(rcfg.get('topk', 1))
+        final_k = stage2_k
+
+    # 熵目标闭环控制参数（可选）
+    ent_target = float(rcfg.get('entropy_target', 0.0))  # 0 表示关闭
+    ent_ctrl_lr = float(rcfg.get('entropy_ctrl_lr', 0.0))
+    tau_r_min = float(rcfg.get('tau_r_min', 0.4))
+    tau_r_max = float(rcfg.get('tau_r_max', 1.5))
+    tau_r_state = None  # 维护一个持久化的 tau_r 状态，避免每步被基线调度完全覆盖
 
     # AMP
     use_amp = bool(cfg['misc'].get('use_amp', True)) and device == 'cuda'
@@ -410,6 +368,15 @@ def main():
     resume_path = args.resume or str(cfg['misc'].get('resume') or '')
     start_epoch = 1
     global_step = 0
+    # MMM/TMCL 超参（统一从 cfg 读取）
+    mmm_cfg = dict(cfg.get('mmm', {}))
+    mmm_ratio = float(mmm_cfg.get('mask_ratio', 0.15))
+    graph_cfg = dict(cfg.get('graph', {}))
+    graph_ratio_l = float(graph_cfg.get('mask_ratio_light', mmm_ratio))
+    graph_ratio_h = float(graph_cfg.get('mask_ratio_heavy', mmm_ratio))
+    graph_temp = float(graph_cfg.get('temperature', 0.2))
+    graph_loss_type = str(graph_cfg.get('loss', 'tmcl')).lower()
+    graph_margin = float(graph_cfg.get('margin', 0.2))
     best_val = float('inf')
     if resume_path and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location='cpu')
@@ -435,94 +402,95 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         print(f"Epoch {epoch}/{epochs} - training...")
         model.train()
+        # 保险丝持久化状态（跨 step 保持）
         safeguard_until_step = -1
+        sg_bad_count = 0
+        sg_good_count = 0
         for it, batch in enumerate(dl_train, start=1):
             batch = batch.to(device)
-            # 线性调度 tau_r 与 beta（前 warmup_steps 过渡，之后恒定为 end）
-            # 一阶段：从 tau_r_start 线性过渡到 tau_r_end
-            progress = min(1.0, float(global_step) / max(1, warmup_steps))
-            cur_tau_r = tau_r_start + (tau_r_end - tau_r_start) * progress
-            # 二阶段（可选）：在后期进一步从当前温度线性过渡到 boost_end_tau
-            if boost_start >= 0 and boost_dur > 0:
-                p2 = (float(global_step) - float(boost_start)) / float(max(1, boost_dur))
-                p2 = 0.0 if p2 < 0.0 else (1.0 if p2 > 1.0 else p2)
-                cur_tau_r = cur_tau_r + (boost_end_tau - cur_tau_r) * p2
-            cur_beta = beta_start + (beta_end - beta_start) * progress
-            # 晚期将 β 进一步提升，逐渐更依赖路由器（避免长期过度均匀）
-            if beta_boost_start >= 0 and beta_boost_dur > 0:
-                p_b = (float(global_step) - float(beta_boost_start)) / float(max(1, beta_boost_dur))
-                p_b = 0.0 if p_b < 0.0 else (1.0 if p_b > 1.0 else p_b)
-                cur_beta = cur_beta + (beta_boost_end - cur_beta) * p_b
-            model.set_router_params(cur_tau_r, cur_beta)
-            # Safeguard: if previously flagged, temporarily soften routing
-            if 'safeguard_until_step' in locals() and global_step < safeguard_until_step:
-                # clamp beta and use softer selection
-                cur_beta = min(cur_beta, 0.6)
-                model.set_router_params(cur_tau_r, cur_beta)
-                # also raise teacher temperature a bit if available
-                if hasattr(model, 'teacher_temperature'):
-                    try:
-                        model.set_teacher_temperature(max(float(getattr(model,'teacher_temperature',2.6)), 2.8))
-                    except Exception:
-                        pass
-
-            # 教师温度退火：从较高温度逐步降低到更“冷”的几何原型
-            if tt_decay_steps > 0 and tt_decay_start >= 0:
-                p_tt = (float(global_step) - float(tt_decay_start)) / float(max(1, tt_decay_steps))
-                p_tt = 0.0 if p_tt < 0.0 else (1.0 if p_tt > 1.0 else p_tt)
-                cur_tt = tt_start + (tt_end - tt_start) * p_tt
-                model.set_teacher_temperature(cur_tt)
-            # Top-K 分段调度（优先使用可选 schedule；否则退回原 warmup 逻辑）
-            tks = rcfg.get('topk_schedule', None)
-            if isinstance(tks, dict):
-                s1 = int(tks.get('stage1_until', topk_warmup_steps))
-                s2 = int(tks.get('stage2_until', s1))
-                k2 = int(tks.get('stage2_k', 4))
-                kf = int(tks.get('final_k', int(rcfg.get('topk', 1))))
-                if global_step < s1:
-                    model.set_topk(0)
-                elif global_step < s2:
-                    model.set_topk(k2)
+            # 按步应用损失权重与调度（熵/均衡/commit 等）
+            weights_cur = current_weights(global_step)
+            # Prototype Top‑K 调度：前期使用更宽的 top‑k，后期收敛为 1
+            if isinstance(proto_sched, dict):
+                if stage2_until > 0 and global_step < stage2_until:
+                    k_cur = stage2_k
                 else:
-                    model.set_topk(kf)
-            else:
-                # 旧逻辑：仅 warmup 后启用固定 Top‑K
-                if topk_warmup_steps > 0 and global_step < topk_warmup_steps:
-                    model.set_topk(0)
+                    k_cur = final_k
+                if hasattr(model, 'set_proto_topk'):
+                    model.set_proto_topk(int(k_cur))
+            # 教师温度退火（若启用），按步更新到模型
+            if hasattr(model, 'set_teacher_temperature') and getattr(model, 'teacher_enabled', False):
+                if tt_decay_start >= 0 and tt_decay_steps > 0:
+                    if global_step < tt_decay_start:
+                        tt = tt_start
+                    else:
+                        p = min(1.0, max(0.0, float(global_step - tt_decay_start) / float(max(1, tt_decay_steps))))
+                        tt = tt_start + (tt_end - tt_start) * p
                 else:
-                    model.set_topk(int(rcfg.get('topk', 1)))
-            # 校准时禁用 teacher_z 构造 p_t；对齐后再启用
-            try:
-                model.set_use_teacher_for_pt(not calib_active)
-            except Exception:
-                pass
-            # Safeguard forces soft selection (expectation) for a short window
-            if 'safeguard_until_step' in locals() and global_step < safeguard_until_step:
-                model.set_topk(0)
-            # 当前 teacher 动态权重
-            weights_cur, vq_w_cur, rc_w_cur = current_weights(global_step)
+                    tt = float(rcfg.get('teacher_temperature', tt_start))
+                model.set_teacher_temperature(float(tt))
             with torch.cuda.amp.autocast(enabled=use_amp):
-                z_hat, h_motif, e_k, logits, topk, router_info = model(batch)
-                z_gt = batch.motif_target
-                losses = compute_losses(
-                    z_hat=z_hat, z_gt=z_gt, h_motif_2d=h_motif, e_k=e_k,
-                    weights=weights_cur, router=router_info,
-                    teacher_z=router_info.get('teacher_z') if router_info is not None else None
-                )
-                loss = losses['loss']
+                freeze_now = (global_step < delta_freeze_steps)
+                h_motif_2d, h_enh, router_info = model(batch, freeze_delta=freeze_now)
+                losses = compute_losses(h_motif_2d=h_motif_2d, router=router_info, weights=weights_cur)
+                loss_total = losses['loss']
 
-            # NaN/Inf 监控与保护
-            if not torch.isfinite(loss):
-                msg = f"Non-finite loss detected at step {global_step}: {float(loss.detach().cpu())}"
-                print(msg)
-                writer.add_text('alerts/non_finite_loss', msg, global_step)
-                nan_ckpt = os.path.join(run_dir, f'nan_detected_step{global_step}.ckpt')
-                _save_ckpt(nan_ckpt, model, optim, None, epoch, global_step, best_val, scaler if use_amp else None)
-                break
+                # 1) Masked Motif Modeling (MMM) —— 目标使用 gt_nn_index（几何最近原型）
+                mmm_w = float(cfg.get('loss', {}).get('mmm_weight', 0.0))
+                if mmm_w > 0.0:
+                    num_motifs = int(batch.motif_target.size(0))
+                    prob = torch.full((num_motifs,), mmm_ratio, device=batch.motif_target.device)
+                    msk = torch.bernoulli(prob).bool()
+                    if msk.any():
+                        _, _, info_m = model(batch, motif_mask=msk, freeze_delta=freeze_now)
+                        assert 'gt_nn_index' in router_info, 'router_info.gt_nn_index missing for MMM target'
+                        k_target = router_info['gt_nn_index']
+                        ce_mmm = F.cross_entropy(info_m['logits_code'][msk].float(), k_target[msk].long())
+                        loss_total = loss_total + mmm_w * ce_mmm
+                        losses['mmm'] = ce_mmm
+
+                # 2) Graph-level masked contrastive (TMCL 风格)
+                g_w = float(cfg.get('loss', {}).get('graph_weight', 0.0))
+                if g_w > 0.0:
+                    num_motifs = int(batch.motif_target.size(0))
+                    prob_l = torch.full((num_motifs,), graph_ratio_l, device=batch.motif_target.device)
+                    prob_h = torch.full((num_motifs,), graph_ratio_h, device=batch.motif_target.device)
+                    m1 = torch.bernoulli(prob_l).bool()
+                    m2 = torch.bernoulli(prob_h).bool()
+                    # 两个掩码视图
+                    _, _, info_m1 = model(batch, motif_mask=m1, freeze_delta=freeze_now)
+                    _, _, info_m2 = model(batch, motif_mask=m2, freeze_delta=freeze_now)
+                    # motif → graph READOUT（sum/mean）
+                    from momo.data.pcqm4mv2 import _infer_num_motifs_per_graph
+                    g_counts = _infer_num_motifs_per_graph(batch.motif_id, batch.batch)
+                    motif_graph_ids = torch.repeat_interleave(torch.arange(g_counts.numel(), device=g_counts.device), g_counts)
+                    def _graph_readout(feat: torch.Tensor) -> torch.Tensor:
+                        outg = torch.zeros((g_counts.numel(), feat.size(1)), dtype=feat.dtype, device=feat.device)
+                        outg = outg.index_add(0, motif_graph_ids, feat)
+                        if str(cfg['model'].get('readout','sum')).lower() == 'mean':
+                            denom = g_counts.clamp(min=1).view(-1, 1).to(outg.dtype)
+                            outg = outg / denom
+                        return outg
+                    h_enh = router_info['h_motif_enh']
+                    g0 = _graph_readout(h_enh)
+                    g1 = _graph_readout(info_m1['h_motif_enh'])
+                    g2 = _graph_readout(info_m2['h_motif_enh'])
+                    # 对比损失（采用 NT-Xent 近似 TMCL）
+                    def _nt_xent(a: torch.Tensor, p: torch.Tensor, t: float) -> torch.Tensor:
+                        a_n = F.normalize(a, dim=-1)
+                        p_n = F.normalize(p, dim=-1)
+                        logits = a_n @ p_n.t() / max(t, 1e-8)
+                        targets = torch.arange(a.size(0), device=a.device)
+                        return F.cross_entropy(logits, targets)
+                    loss_graph = 0.5 * (_nt_xent(g0, g1, graph_temp) + _nt_xent(g0, g2, graph_temp))
+                    loss_total = loss_total + g_w * loss_graph
+                    losses['graph'] = loss_graph
+
+            # 不做数值兜底，保持快速失败
 
             optim.zero_grad(set_to_none=True)
             if use_amp:
-                scaler.scale(loss).backward()
+                scaler.scale(loss_total).backward()
                 # 先反缩放再裁剪
                 if grad_clip_norm and grad_clip_norm > 0:
                     scaler.unscale_(optim)
@@ -530,52 +498,42 @@ def main():
                 scaler.step(optim)
                 scaler.update()
             else:
-                loss.backward()
+                loss_total.backward()
                 if grad_clip_norm and grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
                 optim.step()
 
             # TensorBoard logging (train)
             if global_step % log_every == 0:
-                writer.add_scalar('train/loss', float(losses['loss'].detach().cpu()), global_step)
+                # 记录实际反传总损与主链路基础损
+                writer.add_scalar('train/loss', float(loss_total.detach().cpu()), global_step)
+                writer.add_scalar('train/loss_base', float(losses['loss'].detach().cpu()), global_step)
                 writer.add_scalar('train/recon', float(losses['recon'].detach().cpu()), global_step)
+                writer.add_scalar('train/proto_recon', float(losses['proto_recon'].detach().cpu()), global_step)
+                writer.add_scalar('train/delta_res', float(losses['delta_res'].detach().cpu()), global_step)
+                writer.add_scalar('train/orth', float(losses['orth'].detach().cpu()), global_step)
                 writer.add_scalar('train/vq', float(losses['vq'].detach().cpu()), global_step)
                 writer.add_scalar('train/commit', float(losses['commit'].detach().cpu()), global_step)
                 writer.add_scalar('train/lr', optim.param_groups[0]['lr'], global_step)
+                if 'mmm' in losses:
+                    writer.add_scalar('train/mmm', float(losses['mmm'].detach().cpu()), global_step)
+                if 'graph' in losses:
+                    writer.add_scalar('train/graph', float(losses['graph'].detach().cpu()), global_step)
                 writer.add_scalar('train/kl', float(losses['kl'].detach().cpu()), global_step)
                 writer.add_scalar('train/ce', float(losses['ce'].detach().cpu()), global_step)
                 writer.add_scalar('train/ent', float(losses['ent'].detach().cpu()), global_step)
-                writer.add_scalar('train/router_tau_r', cur_tau_r, global_step)
-                writer.add_scalar('train/router_beta', cur_beta, global_step)
-                writer.add_scalar('train/teacher_auto/vq_weight', float(vq_w_cur), global_step)
-                writer.add_scalar('train/teacher_auto/recon_weight', float(rc_w_cur), global_step)
-                # 代码使用率与 Top-k 命中率
-                if model.router_topk > 1 and 'topk_indices' in router_info:
-                    sel = router_info['topk_indices'].detach()
-                    sel_flat = sel.reshape(-1)
-                    nn_idx = router_info.get('teacher_nn_index', None)
-                    hit = 0.0
-                    if nn_idx is not None:
-                        nn_idx = nn_idx.detach()
-                        hit = (sel == nn_idx.view(-1, 1)).any(dim=1).float().mean().item()
-                    writer.add_scalar('train/router/topk_nn_hit', hit, global_step)
-                    used = torch.unique(sel_flat).numel() / float(model.codebook_size)
-                    writer.add_scalar('train/router/usage_unique_ratio', used, global_step)
-                    writer.add_histogram('train/router/selected_codes', sel_flat.to(torch.float32), global_step)
-                else:
-                    sel = topk.view(-1) if 'topk' in locals() else topk_idx.view(-1)
-                    nn_idx = router_info.get('teacher_nn_index', None)
-                    hit = 0.0
-                    if nn_idx is not None:
-                        nn_idx = nn_idx.detach()
-                        hit = (sel == nn_idx).float().mean().item()
-                    writer.add_scalar('train/router/top1_nn_hit', hit, global_step)
-                    used = torch.unique(sel).numel() / float(model.codebook_size)
-                    writer.add_scalar('train/router/usage_unique_ratio', used, global_step)
-                    writer.add_histogram('train/router/selected_codes', sel.to(torch.float32), global_step)
-                # 有效代码数（两种口径：batch-mean 与 sample-mean）
+                writer.add_scalar('train/balance', float(losses['balance'].detach().cpu()), global_step)
+                writer.add_scalar('train/geom_align', float(losses['geom_align'].detach().cpu()), global_step)
+                # 原型 Top‑1 命中率与使用度（几何目标）
+                assert 'gt_nn_index' in router_info, 'router_info.gt_nn_index missing'
+                sel = torch.argmax(router_info['p_code'].detach(), dim=-1)
+                nn_idx = router_info['gt_nn_index'].detach()
+                hit = (sel == nn_idx).float().mean().item()
+                writer.add_scalar('train/router/top1_nn_hit', hit, global_step)
+                used = torch.unique(sel).numel() / float(model.codebook_size)
+                writer.add_scalar('train/router/usage_unique_ratio', used, global_step)
+                # 有效代码数
                 y_soft = router_info['y_soft'].detach()
-                p_t = router_info.get('p_t', None)
                 p_mean = y_soft.mean(dim=0)
                 eps = 1e-8
                 eff = torch.exp(-(p_mean * (p_mean + eps).log()).sum()).item()
@@ -584,132 +542,62 @@ def main():
                 ent_per = (-ys_clamped * ys_clamped.log()).sum(dim=-1)
                 eff_sample = torch.exp(ent_per).mean().item()
                 writer.add_scalar('train/router/effective_codes_sample', eff_sample, global_step)
-                # Write safeguard flag
-                writer.add_scalar('train/router/safeguard_active', 1.0 if ('safeguard_until_step' in locals() and global_step < safeguard_until_step) else 0.0, global_step)
-                # 额外监控：与教师分布的匹配度
-                if p_t is not None:
-                    pt = p_t.detach()
-                    ys = torch.clamp(y_soft, min=eps)
-                    ptc = torch.clamp(pt, min=eps)
-                    kl1 = torch.sum(ptc * (ptc.log() - ys.log()), dim=-1).mean().item()
-                    kl2 = torch.sum(ys * (ys.log() - ptc.log()), dim=-1).mean().item()
-                    writer.add_scalar('train/router/kl_to_teacher', kl1 + kl2, global_step)
-                    writer.add_scalar('train/router/y_soft_entropy', float((-ys * ys.log()).sum(dim=-1).mean().item()), global_step)
-                    writer.add_scalar('train/router/p_t_entropy', float((-ptc * ptc.log()).sum(dim=-1).mean().item()), global_step)
-                    # Trigger safeguard with hysteresis: BOTH low entropy and low effective codes (sample-wise)
-                    try:
-                        ent_val = float((-ys * ys.log()).sum(dim=-1).mean().item())
-                    except Exception:
-                        ent_val = 0.0
-                    bad = (ent_val < 0.05) and (eff_sample < 8.0)
-                    # Initialize counters if missing
-                    if 'sg_bad_count' not in locals():
-                        sg_bad_count = 0
-                    if 'sg_good_count' not in locals():
-                        sg_good_count = 0
-                    # Activate only when not currently active and we saw enough consecutive bad signals
-                    if ('safeguard_until_step' not in locals()) or (global_step >= safeguard_until_step):
-                        if bad:
-                            sg_bad_count += 1
-                            sg_good_count = 0
-                        else:
-                            sg_good_count += 1
-                            sg_bad_count = 0
-                        if bad and sg_bad_count >= 5:
-                            safeguard_until_step = global_step + 2000
-                    else:
-                        # During safeguard window, allow early release after consecutive good observations
-                        if not bad:
-                            sg_good_count += 1
-                            if sg_good_count >= 5:
-                                safeguard_until_step = global_step
-                if 'vq_teacher' in losses:
-                    writer.add_scalar('train/vq_teacher', float(losses['vq_teacher'].detach().cpu()), global_step)
-                    writer.add_scalar('train/recon_teacher', float(losses['recon_teacher'].detach().cpu()), global_step)
-                    writer.add_scalar('train/teacher_align', float(losses['teacher_align'].detach().cpu()), global_step)
-                if 'balance' in losses:
-                    writer.add_scalar('train/router/balance', float(losses['balance'].detach().cpu()), global_step)
-                print(f"step {global_step}: loss={float(losses['loss'].detach().cpu()):.4f}"
+                # 专家负载均衡
+                if 'exp_balance' in losses:
+                    writer.add_scalar('train/exp_balance', float(losses['exp_balance'].detach().cpu()), global_step)
+                print(f"step {global_step}: loss={float(loss_total.detach().cpu()):.4f} base={float(losses['loss'].detach().cpu()):.4f}"
                       f" recon={float(losses['recon'].detach().cpu()):.4f}"
+                      f" proto_recon={float(losses['proto_recon'].detach().cpu()):.4f}"
+                      f" delta_res={float(losses['delta_res'].detach().cpu()):.4f}"
+                      f" orth={float(losses['orth'].detach().cpu()):.4f}"
                       f" vq={float(losses['vq'].detach().cpu()):.4f}"
                       f" commit={float(losses['commit'].detach().cpu()):.4f}"
                       f" kl={float(losses['kl'].detach().cpu()):.4f}"
                       f" ce={float(losses['ce'].detach().cpu()):.4f}"
                       f" ent={float(losses['ent'].detach().cpu()):.4f}"
-                      f" balance={float(losses['balance'].detach().cpu()):.4f}")
+                      f" balance={float(losses['balance'].detach().cpu()):.4f}"
+                      f" exp_balance={float(losses.get('exp_balance', torch.tensor(0.0)).detach().cpu()):.4f}"
+                      f" mmm={float(losses.get('mmm', torch.tensor(0.0)).detach().cpu()):.4f}"
+                      f" graph={float(losses.get('graph', torch.tensor(0.0)).detach().cpu()):.4f}")
 
             global_step += 1
 
             # 按步评估（可选）并对齐 global_step 写入
             if eval_every_steps > 0 and (global_step % eval_every_steps == 0):
-                w_eval, _, _ = current_weights(global_step)
-                metrics = eval_epoch(model, dl_val, device, w_eval)
+                metrics = eval_epoch(model, dl_val, device, cfg['loss'])
                 writer.add_scalar('val/loss', metrics['loss'], global_step)
                 writer.add_scalar('val/recon', metrics['recon'], global_step)
+                writer.add_scalar('val/proto_recon', metrics['proto_recon'], global_step)
+                writer.add_scalar('val/delta_res', metrics['delta_res'], global_step)
+                writer.add_scalar('val/orth', metrics['orth'], global_step)
                 writer.add_scalar('val/vq', metrics['vq'], global_step)
                 writer.add_scalar('val/commit', metrics['commit'], global_step)
-                writer.add_scalar('val/teacher_align', metrics['teacher_align'], global_step)
                 print(f"[step-eval] step {global_step} eval: loss={metrics['loss']:.4f}"
-                      f" recon={metrics['recon']:.4f} vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}")
-                # 自动开启门控：对齐稳定后触发蒸馏权重升温
-                if ta_mode == 'align_gate' and (not ta_triggered) and global_step >= ta_start_after:
-                    if metrics['teacher_align'] <= ta_threshold:
-                        ta_gate_hits += 1
-                    else:
-                        ta_gate_hits = 0
-                    if ta_gate_hits >= ta_patience:
-                        ta_triggered = True
-                        ta_ramp_start = global_step
-                        writer.add_text('teacher_auto', f'triggered at step {global_step}, ramp_steps={ta_ramp}', global_step)
-                # 结束校准阶段：teacher 对齐稳定
-                if calib_active and global_step >= calib_min_steps:
-                    if metrics['teacher_align'] <= calib_threshold:
-                        calib_hits += 1
-                    else:
-                        calib_hits = 0
-                    if calib_hits >= calib_patience:
-                        calib_active = False
-                        writer.add_text('calibration', f'calibration finished at step {global_step}', global_step)
+                      f" recon={metrics['recon']:.4f} proto_recon={metrics['proto_recon']:.4f}"
+                      f" delta_res={metrics['delta_res']:.4f} orth={metrics['orth']:.4f}"
+                      f" vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}")
 
         # Eval per epoch
         if (epoch % eval_every) == 0:
-            w_eval, _, _ = current_weights(global_step)
-            metrics = eval_epoch(model, dl_val, device, w_eval)
+            metrics = eval_epoch(model, dl_val, device, cfg['loss'])
             # 用当前 global_step 写入，便于与训练曲线对齐
             writer.add_scalar('val/loss', metrics['loss'], global_step)
             writer.add_scalar('val/recon', metrics['recon'], global_step)
+            writer.add_scalar('val/proto_recon', metrics['proto_recon'], global_step)
+            writer.add_scalar('val/delta_res', metrics['delta_res'], global_step)
+            writer.add_scalar('val/orth', metrics['orth'], global_step)
             writer.add_scalar('val/vq', metrics['vq'], global_step)
             writer.add_scalar('val/commit', metrics['commit'], global_step)
             writer.add_scalar('val/kl', metrics['kl'], global_step)
             writer.add_scalar('val/ce', metrics['ce'], global_step)
             writer.add_scalar('val/ent', metrics['ent'], global_step)
             writer.add_scalar('val/balance', metrics['balance'], global_step)
-            writer.add_scalar('val/vq_teacher', metrics['vq_teacher'], global_step)
-            writer.add_scalar('val/recon_teacher', metrics['recon_teacher'], global_step)
-            writer.add_scalar('val/teacher_align', metrics['teacher_align'], global_step)
             print(f"Epoch {epoch} eval: loss={metrics['loss']:.4f}"
-                  f" recon={metrics['recon']:.4f} vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}"
-                  f" kl={metrics['kl']:.4f} ce={metrics['ce']:.4f} ent={metrics['ent']:.4f}"
-                  f" vqt={metrics['vq_teacher']:.4f} rct={metrics['recon_teacher']:.4f}"
-                  f" talign={metrics['teacher_align']:.4f}")
-            if ta_mode == 'align_gate' and (not ta_triggered) and global_step >= ta_start_after:
-                if metrics['teacher_align'] <= ta_threshold:
-                    ta_gate_hits += 1
-                else:
-                    ta_gate_hits = 0
-                if ta_gate_hits >= ta_patience:
-                    ta_triggered = True
-                    ta_ramp_start = global_step
-                    writer.add_text('teacher_auto', f'triggered at step {global_step}, ramp_steps={ta_ramp}', global_step)
-            # 结束校准阶段（按 epoch 评估）
-            if calib_active and global_step >= calib_min_steps:
-                if metrics['teacher_align'] <= calib_threshold:
-                    calib_hits += 1
-                else:
-                    calib_hits = 0
-                if calib_hits >= calib_patience:
-                    calib_active = False
-                    writer.add_text('calibration', f'calibration finished at step {global_step}', global_step)
+                  f" recon={metrics['recon']:.4f} proto_recon={metrics['proto_recon']:.4f}"
+                  f" delta_res={metrics['delta_res']:.4f} orth={metrics['orth']:.4f}"
+                  f" vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}"
+                  f" kl={metrics['kl']:.4f} ce={metrics['ce']:.4f} ent={metrics['ent']:.4f}")
+            # 单一路径：不使用 teacher_auto 或校准阶段
 
         # Step scheduler
         if scheduler is not None:

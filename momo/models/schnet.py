@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,13 +19,14 @@ class GaussianSmearing(nn.Module):
 
 
 class CFConv(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, num_filters, mlp, cutoff):
+    def __init__(self, in_channels, out_channels, num_filters, mlp, cutoff, normalize_messages: bool = True):
         super().__init__()
         # Use the torch.nn module (aliased as nn) for layers; avoid shadowing by args
         self.lin1 = nn.Linear(in_channels, num_filters, bias=False)
         self.lin2 = nn.Linear(num_filters, out_channels)
         self.mlp = mlp
         self.cutoff = cutoff
+        self.normalize_messages = bool(normalize_messages)
 
         self.reset_parameters()
 
@@ -48,20 +50,33 @@ class CFConv(torch.nn.Module):
         out = torch.zeros_like(x)
         src = self.message(x[col], W)
         out.index_add_(0, row, src)
+        # 可选：按入度做归一化，抑制局部极大邻居数导致的尺度爆炸
+        if self.normalize_messages:
+            deg = torch.zeros(x.size(0), dtype=dtype, device=x.device)
+            ones = torch.ones_like(row, dtype=dtype)
+            deg.index_add_(0, row, ones)
+            deg = torch.clamp(deg, min=1.0).view(-1, 1)
+            out = out / deg
         out = self.lin2(out)
         return out
 
 
 class InteractionBlock(torch.nn.Module):
-    def __init__(self, hidden_channels, num_gaussians, num_filters, cutoff):
+    def __init__(self, hidden_channels, num_gaussians, num_filters, cutoff, normalize_messages: bool = True, activation: str = 'shifted_softplus'):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(num_gaussians, num_filters),
             nn.Softplus(),
             nn.Linear(num_filters, num_filters),
         )
-        self.conv = CFConv(hidden_channels, hidden_channels, num_filters, self.mlp, cutoff)
-        self.act = nn.Softplus()
+        self.conv = CFConv(hidden_channels, hidden_channels, num_filters, self.mlp, cutoff, normalize_messages=normalize_messages)
+        if str(activation).lower() == 'shifted_softplus':
+            # 与 SchNet 一致：softplus(x) - ln(2)
+            self.act = lambda x: F.softplus(x) - math.log(2.0)
+        elif str(activation).lower() == 'silu':
+            self.act = nn.SiLU()
+        else:
+            self.act = nn.Softplus()
         self.lin = nn.Linear(hidden_channels, hidden_channels)
 
         self.reset_parameters()
@@ -82,21 +97,38 @@ class InteractionBlock(torch.nn.Module):
 
 
 class AtomSchNet(nn.Module):
-    """A minimal SchNet returning atom-level embeddings (no pooling)."""
-    def __init__(self, hidden_channels=128, num_filters=128, num_interactions=6, num_gaussians=50, cutoff=10.0):
+    """A minimal SchNet returning atom-level embeddings (no pooling).
+
+    Supports injecting external initial atom features via `h0` in forward.
+    When `h0` is provided, the internal atom embedding lookup is bypassed so
+    upstream models can share a single atom embedding table across 2D/3D.
+    """
+    def __init__(self, hidden_channels=128, num_filters=128, num_interactions=6, num_gaussians=50, cutoff=10.0,
+                 max_num_neighbors: int = 32, normalize_messages: bool = True, activation: str = 'shifted_softplus'):
         super().__init__()
         self.hidden_channels = hidden_channels
+        # Keep an internal embedding for backward compatibility; can be bypassed.
         self.embedding = nn.Embedding(119, hidden_channels)
         self.distance_expansion = GaussianSmearing(0.0, cutoff, num_gaussians)
         self.cutoff = cutoff
+        self.max_num_neighbors = int(max_num_neighbors)
+        self.normalize_messages = bool(normalize_messages)
+        self.activation = activation
 
         self.interactions = nn.ModuleList()
         for _ in range(num_interactions):
-            block = InteractionBlock(hidden_channels, num_gaussians, num_filters, cutoff)
+            block = InteractionBlock(hidden_channels, num_gaussians, num_filters, cutoff,
+                                     normalize_messages=self.normalize_messages, activation=self.activation)
             self.interactions.append(block)
 
         self.lin1 = nn.Linear(hidden_channels, hidden_channels)
-        self.act = nn.Softplus()
+        # 与 SchNet 一致的激活（默认 shifted softplus）
+        if str(self.activation).lower() == 'shifted_softplus':
+            self.act = lambda x: F.softplus(x) - math.log(2.0)
+        elif str(self.activation).lower() == 'silu':
+            self.act = nn.SiLU()
+        else:
+            self.act = nn.Softplus()
         self.lin2 = nn.Linear(hidden_channels, hidden_channels)
 
         self.reset_parameters()
@@ -108,10 +140,18 @@ class AtomSchNet(nn.Module):
         torch.nn.init.xavier_uniform_(self.lin2.weight)
         self.lin2.bias.data.fill_(0)
 
-    def forward(self, z: torch.Tensor, pos: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, pos: torch.Tensor, batch: torch.Tensor, h0: torch.Tensor = None) -> torch.Tensor:
         assert z.dim() == 1 and z.dtype == torch.long
-        h = self.embedding(z)
-        edge_index = radius_graph(pos, r=self.cutoff, batch=batch)
+        if h0 is None:
+            h = self.embedding(z)
+        else:
+            # Use external initial features; ensure channel dimension matches
+            assert h0.dim() == 2 and h0.size(0) == z.size(0), "h0 shape must be [N_atoms, hidden_channels]"
+            assert h0.size(1) == self.hidden_channels, (
+                f"h0 hidden dim {h0.size(1)} != SchNet hidden_channels {self.hidden_channels}"
+            )
+            h = h0
+        edge_index = radius_graph(pos, r=self.cutoff, batch=batch, max_num_neighbors=self.max_num_neighbors)
         row, col = edge_index
         edge_weight = (pos[row] - pos[col]).norm(dim=-1)
         edge_attr = self.distance_expansion(edge_weight)

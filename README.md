@@ -22,6 +22,8 @@
 - 查看训练曲线
   - `tensorboard --logdir runs`
 
+  
+
 - 断点恢复
   - `python -m momo.train.pretrain --cfg configs/pretrain_pcqm4mv2.yaml --run_name pretrain-local --resume checkpoints/pretrain-local/last.ckpt`
 
@@ -43,7 +45,13 @@
 
 ```
 ROOT=data/MoleculeNet \
-CKPT=checkpoints/pretrain-pcqm4mv2-20260315-234536-gpu212-10/best.ckpt \
-DATASETS="bbbp" MODE=scaffold SEED=0 EPOCHS=120 BATCH=256 LR=1e-3 LR_SCALE=5 POOL=sum \
+CKPT=checkpoints/pretrain-pcqm4mv2-20260401-014144-gpu213-18/best.ckpt \
+DATASETS="esol" MODE=scaffold SEED=0 EPOCHS=440 BATCH=256 LR=1e-3 LR_SCALE=5 POOL=sum \
+sbatch scripts/finetune_moleculenet.sh
+
+
+ROOT=data/MoleculeNet \
+CKPT=checkpoints/pretrain-pcqm4mv2-20260402-175612-gpu212-18/best.ckpt \
+DATASETS="bbbp" MODE=scaffold SEED=0 EPOCHS=440 BATCH=256 LR=1e-3 LR_SCALE=5 POOL=sum \
 sbatch scripts/finetune_moleculenet.sh
 ```

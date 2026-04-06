@@ -19,7 +19,7 @@ def main():
 
     ds = PCQM4Mv2MotifDataset(
         preprocessed_path=cfg['dataset']['preprocessed_path'],
-        z3d_dim=cfg['model']['z3d_dim'],
+        z3d_dim=cfg['model']['geom_dim'],
         max_atomic_num=cfg['dataset']['max_atomic_num'],
         require_pos=bool(cfg.get('teacher', {}).get('enabled', False)),
     )
@@ -33,19 +33,11 @@ def main():
     batch = next(iter(dl))
     batch = batch.to(device)
 
-    z_hat, h_motif, e_k, logits, topk, router_info = model(batch)
-    # 与 GT 对齐
-    z_gt = batch.motif_target
-    assert z_gt.shape == z_hat.shape
-
+    h_motif_2d, h_motif_enh, router_info = model(batch)
     losses = compute_losses(
-        z_hat=z_hat,
-        z_gt=z_gt,
-        h_motif_2d=h_motif,
-        e_k=e_k,
-        weights=cfg['loss'],
+        h_motif_2d=h_motif_2d,
         router=router_info,
-        teacher_z=router_info.get('teacher_z') if router_info is not None else None,
+        weights=cfg['loss'],
     )
     print({k: float(v.detach().cpu()) for k, v in losses.items()})
 

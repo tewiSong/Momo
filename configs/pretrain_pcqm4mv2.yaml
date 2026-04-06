@@ -1,58 +1,58 @@
 dataset:
   preprocessed_path: data/pcqm4m_v2_motif_preprocessed.pkl
-  batch_size: 8
-  num_workers: 2
+  batch_size: 16
+  num_workers: 4
   shuffle: true
   max_atomic_num: 100  # 原子编号上限（用于Embedding大小），断言会检查输入不越界
   val_ratio: 0.05      # 训练/验证划分比例
 
 model:
   hidden_dim: 256
+  geom_dim: 7
   num_gin_layers: 5
   gin_mlp_hidden: 256
   dropout: 0.1
-  z3d_dim: 7            # 预处理的局部3D特征维度：长度均值/方差、角度均值/方差、惯性主轴特征值(3)
+  z3d_dim: 256          # 保留 teacher 相关设置，但主监督使用 geom_dim 的显式几何标签
   codebook_size: 128
   expert_mlp_hidden: 256
+  num_experts: 8        # 独立 expert 数量（MoE）
   readout: sum          # sum 或 attention
+  delta_scale: 0.2      # 固定缩放 γ，限制 Δ 的容量
+  delta_freeze_steps: 60000  # 训练前期冻结 Δ，使原型先收敛
   codebook_init:
-    name: kmeans        # 选项：random | kmeans
-    sample_size: 200000 # 从全量样本中均匀抽样用于聚类（不足则用全部）
+    name: kmeans        # 几何→latent 投影后做 k-means 初始化 codebook
+    sample_size: 200000
     max_iters: 30
     tol: 1.0e-4
 
 loss:
   recon_weight: 1.0
-  vq_weight: 1.0
-  commit_weight: 0.12
+  proto_recon_weight: 0.3
+  vq_weight: 0.25
+  commit_weight: 0.25
   commit_ramp_steps: 200000   # 进一步放缓早期绑定，避免过早锁定少数码
-  # 融合路由的附加损失权重（需显式设置，避免默认掩盖问题）
-  kl_weight: 0.1
-  ce_weight: 0.0          # 默认关闭硬标签 CE（可改用极小权重）
-  ent_weight: 0.08        # 在 y_soft 上做熵正则，鼓励多样使用
-  balance_weight: 0.02    # 批级均衡正则：把平均分布拉向均匀，缓解马太效应
+  # 路由监督与正则
+  kl_weight: 0.10
+  ce_weight: 0.02
+  ent_weight: 0.01
+  balance_weight: 0.005
+  exp_balance_weight: 0.002
+  # 任务项
+  mmm_weight: 1.0
+  graph_weight: 0.1
+  # Δ 正则
+  delta_l2_weight: 0.001
+  delta_res_weight: 0.5
+  orth_weight: 0.02
   # 0319: 为探索相关项加入“后期退火”调度（避免长期过均匀导致聚类弱、收敛慢）
   ent_schedule:
     start_step: 300000
     duration: 100000
-    end_weight: 0.06
+    end_weight: 0.005
   balance_schedule:
     start_step: 300000
     duration: 100000
-    end_weight: 0.005
-  # Teacher 改为对齐到 z_gt 的监督；蒸馏相关默认关闭，避免主导损失
-  teacher_align_weight: 0.1
-  vq_teacher_weight: 0.0
-  recon_teacher_weight: 0.0
-  # 自动调度：当 teacher_align 低于阈值并持续若干次评估后，线性升温到目标权重
-  teacher_auto:
-    mode: align_gate         # off|align_gate|linear
-    align_threshold: 0.25    # 触发阈值（MSE，已在 z3d 标准化空间）
-    patience: 3              # 连续满足阈值的评估次数
-    start_after_step: 50000  # 至少训练到该步数后才允许触发
-    ramp_steps: 100000       # 触发后的线性升温步数
-    vq_max: 0.1              # 目标最大权重（升温终值）
-    recon_max: 0.05          # 目标最大权重（升温终值）
+    end_weight: 0.003
 
 optim:
   lr: 1e-3
@@ -80,43 +80,64 @@ scheduler:
 
 router:
   distance_temperature: 0.5   # p_nn 的温度（越小越尖锐）
-  teacher_temperature: 3.0    # 几何教师分布温度（更平，以利探索）
-  # 0319: 教师温度退火（高→低），早期鼓励探索，后期促进入簇专化
-  teacher_temperature_start: 3.0
-  teacher_temperature_end: 2.8
-  teacher_temp_decay_start: 200000
-  teacher_temp_decay_steps: 200000
+  teacher_temperature: 2.0    # 降低温度，提升 p_t 区分度
+  gt_temperature: 1.0         # 几何投影与 codebook 的分布温度（用于 p_gt），更软以防早期塌缩
+  # 教师温度退火（高→低），更快进入可分原型
+  teacher_temperature_start: 2.0
+  teacher_temperature_end: 1.2
+  teacher_temp_decay_start: 10000
+  teacher_temp_decay_steps: 60000
   gumbel_tau_start: 1.0       # p_r 的初始 Gumbel-Softmax 温度
   gumbel_tau_end: 0.6         # p_r 的最终温度（略平）
   beta_start: 0.0             # 融合权重起始（更信教师）
   beta_end: 0.5               # 融合权重终值（不过早完全依赖路由）
   warmup_steps: 50000         # 从 start 线性过渡到 end 的步数
-  topk: 4                     # 融合后 Top-K 选通，1 表示 Top-1
-  topk_warmup_steps: 200000   # 显著推迟稀疏化，先把使用度拉起来
+  topk: 4
+  topk_warmup_steps: 60000    # 提前允许稀疏化
+  expert_topk: 2              # Expert 路由 Top‑K 稀疏选通数
   # 0319: 晚期将 β 提升到更高，逐步更信路由器
   beta_boost:
     start_step: 350000
     duration: 150000
-    end_beta: 0.65
+    end_beta: 0.60          # 后期“更信路由”力度略降，抑制过硬
   # 0319: Top‑K 分段调度（期望→Top‑4→Top‑1），帮助进入专化
   topk_schedule:
-    stage1_until: 200000
-    stage2_until: 400000
+    stage1_until: 80000       # 期望向量（topk=0）
+    stage2_until: 220000      # 进入 Top‑K，延后到 commit 基本稳定
     stage2_k: 4
-    final_k: 1
+    final_k: 1                # 收敛期 Top‑1 硬化
   # 训练后期轻微升温 tau_r，提升码本使用度（可选）
   tau_r_boost:
     start_step: 200000        # 提前启动后期软化
     duration: 100000          # 过渡步数
     end_tau: 0.60             # 更平的最终温度
+  # 熵目标闭环：将 y_soft 熵维持在健康区间（关闭则设为 0）
+  entropy_target: 2.08      # 目标熵≈ln(8)，稳态有效码≥8
+  entropy_ctrl_lr: 0.0045   # 略快一点的闭环调节
+  tau_r_min: 0.40
+  tau_r_max: 1.50
 
 teacher:
   enabled: true
   # 从根源修复：先只训练投影层对齐到 z_gt，teacher 主干默认冻结
   trainable: false
   proj_trainable: true
-  hidden_dim: 128
+  hidden_dim: 256
   num_filters: 128
   num_interactions: 6
   num_gaussians: 50
   cutoff: 10.0
+  # 稳定性与参考实现对齐项
+  max_num_neighbors: 32
+  normalize_messages: true
+  activation: shifted_softplus
+
+mmm:
+  mask_ratio: 0.15
+
+graph:
+  mask_ratio_light: 0.15
+  mask_ratio_heavy: 0.30
+  temperature: 0.2
+  loss: tmcl
+  margin: 0.2

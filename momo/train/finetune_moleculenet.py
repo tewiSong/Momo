@@ -81,10 +81,9 @@ def motif_pool_to_graph(feat: torch.Tensor, motif_id: torch.Tensor, batch: torch
 
 
 def forward_graph_repr(model: MotifVQMoE, batch: 'torch_geometric.data.Batch', pooling: str = 'sum') -> torch.Tensor:
-    # 模型前向：返回 z_hat(=E_k+Δ), h_commit(2D->z3d投影)
-    z_hat, h_commit, e_k, logits, topk, router_info = model(batch)
-    # 按 doc.md：使用增强特征 [h_commit, z_hat] 进行下游聚合
-    motif_feat = torch.cat([h_commit, z_hat], dim=-1)
+    # 新前向：返回 h_motif_2d, h_motif_enh, router_info
+    h_motif_2d, h_motif_enh, router_info = model(batch)
+    motif_feat = h_motif_enh
     g_repr = motif_pool_to_graph(motif_feat, batch.motif_id, batch.batch, pooling=pooling)
     return g_repr
 
@@ -141,8 +140,15 @@ def eval_epoch(model: MotifVQMoE, head: nn.Module, dl: DataLoader, device: str, 
         return {'ROC-AUC': float(np.mean(roc_list)) if roc_list else 0.0}, y, p
     else:
         from sklearn.metrics import mean_squared_error, mean_absolute_error
-        rmse = mean_squared_error(y.reshape(-1), p.reshape(-1), squared=False)
-        mae = mean_absolute_error(y.reshape(-1), p.reshape(-1))
+        # 兼容旧版 sklearn（无 squared 参）与新版
+        y1 = y.reshape(-1)
+        p1 = p.reshape(-1)
+        try:
+            rmse = mean_squared_error(y1, p1, squared=False)
+        except TypeError:
+            # 旧版 sklearn：没有 squared 参数，先算 MSE 再开根号
+            rmse = np.sqrt(mean_squared_error(y1, p1))
+        mae = mean_absolute_error(y1, p1)
         return {'RMSE': float(rmse), 'MAE': float(mae)}, y, p
 
 
@@ -327,8 +333,8 @@ def main():
     if args.freeze_backbone:
         for p in model.parameters():
             p.requires_grad = False
-    # 预测头输入为 [h_commit, z_hat] 拼接 => 2 * z3d_dim
-    head_in = int(model.z3d_dim) * 2
+    # 预测头输入改为 D（h_motif_enh 的维度）
+    head_in = int(getattr(model, 'hidden', 256))
     head = build_head(head_in, ds.num_tasks).to(device)
 
     # 优化器（与 GraphMVP 一致：骨干和 head 分组，不同 lr）
@@ -369,7 +375,8 @@ def main():
     if best is not None:
         val_metric, te_metric, yt, pt = best
     else:
-        _, _, yt, pt = eval_epoch(model, head, dl_te, device, task)
+        # 补充 pooling 参数以与函数签名一致
+        _, _, yt, pt = eval_epoch(model, head, dl_te, device, task, pooling=args.graph_pooling)
         val_metric, te_metric, = {}, {}
     np.savez(out_npz, test_target=yt, test_pred=pt, val_metric=val_metric, test_metric=te_metric)
     print(f"Saved results to: {out_npz}")
