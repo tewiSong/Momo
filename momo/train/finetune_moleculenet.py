@@ -27,8 +27,8 @@ import torch
 import torch.nn as nn
 from torch_geometric.loader import DataLoader
 
-from momo.data.moleculenet import MoleculeNetMotifDataset, load_split_indices, CLASSIFICATION_DATASETS, REGRESSION_DATASETS
-from momo.data.pcqm4mv2 import motif_global_index, _infer_num_motifs_per_graph
+from momo.data.moleculenet import load_split_indices, CLASSIFICATION_DATASETS, REGRESSION_DATASETS
+from momo.data.pcqm4mv2 import PCQM4Mv2MotifDataset, motif_global_index, _infer_num_motifs_per_graph
 from momo.models.gin_motif_vqmoe import MotifVQMoE
 from momo.utils.config import load_yaml
 from rdkit.Chem.Scaffolds import MurckoScaffold
@@ -45,8 +45,7 @@ def get_device(wanted: str = 'cuda') -> str:
     return wanted
 
 
-def build_model(cfg_path: str, ckpt: str | None, device: str) -> MotifVQMoE:
-    cfg = load_yaml(cfg_path)
+def build_model(cfg: dict, ckpt: str | None, device: str) -> MotifVQMoE:
     model = MotifVQMoE(cfg).to(device)
     # 下游 MoleculeNet 只用 2D 拓扑，禁用 teacher 分支以避免需要 pos
     if hasattr(model, 'teacher_enabled'):
@@ -159,7 +158,7 @@ def main():
     ap.add_argument('--preproc-name', type=str, default='', help='预处理 pkl 文件名，留空则使用 {dataset}_motif_preprocessed.pkl')
     ap.add_argument('--mode', type=str, default='scaffold', choices=['scaffold', 'random', 'random_scaffold'])
     ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--cfg', type=str, default='configs/momo.yaml', help='模型配置（与预训练同结构）')
+    ap.add_argument('--cfg', type=str, default='configs/pretrain_pcqm4mv2.yaml', help='模型配置（与预训练同结构）')
     ap.add_argument('--ckpt', type=str, default='', help='可选：加载预训练权重 ckpt（包含 model 或纯 state_dict）')
     ap.add_argument('--device', type=str, default='cuda')
     ap.add_argument('--batch-size', type=int, default=256)
@@ -176,6 +175,7 @@ def main():
 
     setup_seed(args.seed)
     device = get_device(args.device)
+    cfg = load_yaml(args.cfg)
 
     ds_dir = os.path.join(args.root, args.dataset)
     pkl_name = args.preproc_name or f"{args.dataset}_motif_preprocessed.pkl"
@@ -308,15 +308,30 @@ def main():
     # 先构造数据集（需要 pkl，且如果缺 smiles.csv 时可从 pkl 取得 smiles）
     is_clf = args.dataset in CLASSIFICATION_DATASETS
     is_reg = args.dataset in REGRESSION_DATASETS
-    ds = MoleculeNetMotifDataset(preprocessed_path=pkl_path, dataset_name=args.dataset, require_pos=False)
+    ds = PCQM4Mv2MotifDataset(preprocessed_path=pkl_path, z3d_dim=int(cfg['model'].get('edge_target_dim', 7)), max_atomic_num=118, require_pos=False)
     smiles_from_pkl = [rec.get('smiles', '') for rec in ds.data] if hasattr(ds, 'data') else None
 
     # 读取或生成划分索引
     tr_idx, va_idx, te_idx = ensure_splits(ds_dir, mode=args.mode, seed=args.seed, smiles_from_pkl=smiles_from_pkl)
     # 将基于 smiles.csv 的索引映射到 pkl 子集（过滤预处理失败的样本），避免越界
-    tr_idx = ds.remap_indices(tr_idx)
-    va_idx = ds.remap_indices(va_idx)
-    te_idx = ds.remap_indices(te_idx)
+    orig_to_row = {}
+    if hasattr(ds, 'data') and isinstance(ds.data, list) and ds.data and isinstance(ds.data[0], dict) and 'orig_idx' in ds.data[0]:
+        for i, rec in enumerate(ds.data):
+            try:
+                oi = int(rec.get('orig_idx', -1))
+            except Exception:
+                oi = -1
+            if oi >= 0:
+                orig_to_row[oi] = i
+        def _remap(idxs: list[int]) -> list[int]:
+            return [orig_to_row[i] for i in idxs if i in orig_to_row]
+        tr_idx, va_idx, te_idx = _remap(tr_idx), _remap(va_idx), _remap(te_idx)
+    else:
+        # 无 orig_idx，假设一一对应并裁剪到范围
+        n = len(ds)
+        def _clip(idxs: list[int]) -> list[int]:
+            return [i for i in idxs if 0 <= i < n]
+        tr_idx, va_idx, te_idx = _clip(tr_idx), _clip(va_idx), _clip(te_idx)
     sub = torch.utils.data.Subset
     ds_tr, ds_va, ds_te = sub(ds, tr_idx), sub(ds, va_idx), sub(ds, te_idx)
 
@@ -325,7 +340,7 @@ def main():
     dl_te = DataLoader(ds_te, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # 模型与 head
-    model = build_model(args.cfg, args.ckpt or None, device)
+    model = build_model(cfg, args.ckpt or None, device)
     # 微调策略：冻结 codebook（与 doc.md 一致）
     if args.freeze_codebook and hasattr(model, 'codebook'):
         for p in model.codebook.parameters():

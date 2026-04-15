@@ -4,13 +4,17 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from .schnet import AtomSchNet
-from torch_geometric.nn import GINConv
-from torch_scatter import scatter_mean
+from torch_geometric.nn import GINConv, GINEConv
+from torch_scatter import scatter_mean, scatter_add, scatter_max
 
 
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden: int, out_dim: int, dropout: float):
         super().__init__()
+        # Expose channel metadata so PyG (e.g., GINEConv) can
+        # infer input/output channels from custom MLP wrappers.
+        self.in_channels = in_dim
+        self.out_channels = out_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, out_dim)
@@ -48,14 +52,22 @@ class GINStack(nn.Module):
         return x
 
 
-class PrototypeRouter(nn.Module):
-    def __init__(self, in_dim: int, codebook_size: int):
+class GINEStack(nn.Module):
+    def __init__(self, hidden: int, num_layers: int, mlp_hidden: int, dropout: float, edge_dim: int):
         super().__init__()
-        self.fc = nn.Linear(in_dim, codebook_size)
+        layers = []
+        for _ in range(num_layers):
+            mlp = MLP(hidden, mlp_hidden, hidden, dropout)
+            conv = GINEConv(mlp, edge_dim=edge_dim)
+            layers.append(conv)
+        self.layers = nn.ModuleList(layers)
+        self.act = nn.ReLU()
 
-    def forward(self, h_motif: torch.Tensor) -> torch.Tensor:
-        logits = self.fc(h_motif)
-        return logits
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+        for conv in self.layers:
+            x = conv(x, edge_index, edge_attr)
+            x = self.act(x)
+        return x
 
 
 class Codebook(nn.Module):
@@ -94,26 +106,44 @@ class MotifVQMoE(nn.Module):
         rcfg = cfg.get('router', None)
         assert rcfg is not None, "router 配置缺失"
         self.hidden = int(mcfg['hidden_dim'])
-        # 显式几何标签维度（标准化后的 z3d^GT 维度）
-        self.geom_dim = int(mcfg.get('geom_dim', -1))
-        assert self.geom_dim > 0, 'model.geom_dim 必须在配置中显式给出且 > 0'
+        # 边级目标维度（标准化后），默认 7
+        self.edge_target_dim = int(mcfg.get('edge_target_dim', 7))
+        assert self.edge_target_dim > 0, 'model.edge_target_dim 必须在配置中显式给出且 > 0'
         self.codebook_size = int(mcfg['codebook_size'])
-        # Expert 路由参数
         self.num_experts = int(mcfg.get('num_experts', 8))
         assert self.num_experts >= 2
-        self.expert_topk = int(rcfg.get('expert_topk', 2))
-        assert 1 <= self.expert_topk <= self.num_experts
-        # Prototype 路由 Top‑K（用于 ST 硬选择）
-        self.proto_topk = int(rcfg.get('topk', 1))
-        assert self.proto_topk >= 1
         # Δ 缩放系数（限制容量）
         self.delta_scale = float(mcfg.get('delta_scale', 0.2))
+        self.ctx_delta_scale = float(mcfg.get('ctx_delta_scale', 0.1))
+        self.ctx_delta_bottleneck = int(mcfg.get('ctx_delta_bottleneck', max(32, self.hidden // 4)))
+        assert self.ctx_delta_bottleneck > 0
 
         self.atom_encoder = AtomEncoder(int(dcfg['max_atomic_num']), self.hidden)
         # 双分支 GIN：local（仅 motif 内边）与 ctx（仅跨 motif 边）
         self.gin_local = GINStack(self.hidden, int(mcfg['num_gin_layers']), int(mcfg['gin_mlp_hidden']), float(mcfg['dropout']))
-        self.gin_ctx = GINStack(self.hidden, int(mcfg['num_gin_layers']), int(mcfg['gin_mlp_hidden']), float(mcfg['dropout']))
-        self.proto_router = PrototypeRouter(self.hidden, self.codebook_size)
+        # 不再使用原子级跨 motif 边 ctx；上下文语义仅通过 motif 图传递
+        # motif 边特征维度（预处理生成：4 bond onehot + 2 aromatic + 2 rank_norm）
+        self.edge_attr_dim = int(mcfg.get('motif_edge_dim', 8))
+        # 邻居 motif 类型 embedding（用于边语义增强）
+        self.neighbor_type_vocab = int(mcfg.get('neighbor_type_vocab_size', 100000))
+        self.neighbor_type_emb_dim = int(mcfg.get('neighbor_type_emb_dim', 16))
+        self.neighbor_type_emb = nn.Embedding(self.neighbor_type_vocab, self.neighbor_type_emb_dim)
+        # 附件位置 embedding（motif 内局部锚点索引）
+        self.attach_pos_vocab = int(mcfg.get('attach_pos_vocab_size', 64))
+        self.attach_pos_emb_dim = int(mcfg.get('attach_pos_emb_dim', 8))
+        self.attach_pos_emb = nn.Embedding(self.attach_pos_vocab, self.attach_pos_emb_dim)
+        # motif 级上下文 GNN（将邻居 motif 语义汇聚到当前 motif，带边语义）
+        self.gin_motif_ctx = GINEStack(
+            self.hidden,
+            int(mcfg['num_gin_layers']),
+            int(mcfg['gin_mlp_hidden']),
+            float(mcfg['dropout']),
+            edge_dim=(self.edge_attr_dim + self.neighbor_type_emb_dim + 2 * self.attach_pos_emb_dim),
+        )
+        self.vq_proj = nn.Sequential(
+            nn.LayerNorm(self.hidden),
+            nn.Linear(self.hidden, self.hidden),
+        )
         # Codebook 维度与 2D latent 统一为 D=hidden
         self.codebook = Codebook(self.codebook_size, self.hidden)
         # Expert 路由与多专家
@@ -125,14 +155,17 @@ class MotifVQMoE(nn.Module):
         # MMM 掩码 token（用于替换被 mask 的 motif 表征）
         self.mask_token = nn.Parameter(torch.zeros(self.hidden))
 
-        # 显式几何标签 <-> 主 latent 的双向桥接头
-        # zgt_to_latent: 将 7 维几何（或 cfg.geom_dim）投影到 D 维 latent 空间，用于原型监督（p_gt 与最近原型）与 VQ
-        # latent_to_zgt: 将 D 维 latent 回归到几何标签，用于主重建损失
-        self.zgt_to_latent = nn.Sequential(
-            nn.LayerNorm(self.geom_dim),
-            nn.Linear(self.geom_dim, self.hidden),
+        # 路由控制：仅用于距离分布的软诊断，不改变最近邻硬量化。
+        self.router_tau: float = float(rcfg.get('gumbel_tau_start', 1.0))
+        # 主 3D 监督头：用增强后的 motif 表示预测 teacher motif latent。
+        self.main_3d_head = nn.Sequential(
+            nn.Linear(self.hidden, int(mcfg['gin_mlp_hidden'])),
+            nn.ReLU(),
+            nn.Dropout(float(mcfg['dropout'])),
+            nn.Linear(int(mcfg['gin_mlp_hidden']), self.hidden),
         )
-        self.latent_to_zgt = nn.Linear(self.hidden, self.geom_dim)
+        # 边级 Δ -> 几何目标（7 维）
+        self.latent_to_edge = nn.Linear(self.hidden, self.edge_target_dim)
 
         # Teacher (3D encoder) 配置
         tcfg = cfg.get('teacher', None)
@@ -145,9 +178,36 @@ class MotifVQMoE(nn.Module):
         if readout == 'attention':
             self.att_proj = nn.Linear(self.hidden + self.hidden, 1)
 
-        # 教师/几何分布温度
+        # 邻居定向 Δ：基于受约束的 2D 上下文（仅邻居类型、键类型与附件位置）按边生成残差并聚合
+        # 输入严格限制为 [e_hat[src], edge_ctx_uv]，避免以 h_ctx 作为强通道直接复原几何
+        ed_in = (self.hidden) + (self.edge_attr_dim + self.neighbor_type_emb_dim + 2 * self.attach_pos_emb_dim)
+        mid = int(mcfg.get('expert_mlp_hidden', self.hidden))
+        self.edge_delta_mlp = nn.Sequential(
+            nn.Linear(ed_in, mid), nn.ReLU(), nn.Linear(mid, self.hidden)
+        )
+        self.edge_gate_mlp = nn.Sequential(
+            nn.Linear(ed_in, mid), nn.ReLU(), nn.Linear(mid, 1)
+        )
+        # 弱上下文补充分支：先从 h_ctx 中减掉与 e_hat 平行的分量，再通过小瓶颈预测剩余残差。
+        self.ctx_query = nn.Linear(self.hidden, self.ctx_delta_bottleneck)
+        self.ctx_code = nn.Linear(self.hidden, self.ctx_delta_bottleneck)
+        self.ctx_delta_mlp = nn.Sequential(
+            nn.LayerNorm(self.ctx_delta_bottleneck),
+            nn.Linear(self.ctx_delta_bottleneck, mid),
+            nn.ReLU(),
+            nn.Linear(mid, self.hidden),
+        )
+        # ctx 由 unique(ctx, local) 与边语义两路共同决定，使用可学习门控做逐通道融合。
+        self.ctx_fuse_gate = nn.Sequential(
+            nn.LayerNorm(2 * self.hidden),
+            nn.Linear(2 * self.hidden, mid),
+            nn.ReLU(),
+            nn.Linear(mid, self.hidden),
+        )
+        self.ctx_dropout = nn.Dropout(float(mcfg['dropout']))
+
+        # 教师温度
         self.teacher_temperature = float(rcfg.get('teacher_temperature', 1.5))
-        self.gt_temperature = float(rcfg.get('gt_temperature', rcfg.get('distance_temperature', 1.0)))
 
         # Teacher 模型与投影
         if self.teacher_enabled:
@@ -181,7 +241,7 @@ class MotifVQMoE(nn.Module):
         assert h_motif.shape[0] == num_global_motifs
         return h_motif
 
-    def forward(self, data: 'torch_geometric.data.Batch', motif_mask: Optional[torch.Tensor] = None, *, freeze_delta: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, data: 'torch_geometric.data.Batch', motif_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         # 原子编码
         x0 = self.atom_encoder(data.z)
         assert x0.dim() == 2 and x0.size(1) == self.hidden
@@ -190,11 +250,9 @@ class MotifVQMoE(nn.Module):
         ei = data.edge_index
         same = (data.motif_id[ei[0]] == data.motif_id[ei[1]])
         edge_index_local = ei[:, same]
-        edge_index_ctx = ei[:, ~same]
 
-        # 两路 GIN 编码
+        # 原子级编码（仅 motif 内边）：得到 motif 本体的原子表征
         x_local = self.gin_local(x0, edge_index_local)
-        x_ctx = self.gin_ctx(x0, edge_index_ctx)
 
         # 全局 motif 索引
         from momo.data.pcqm4mv2 import motif_global_index, _infer_num_motifs_per_graph
@@ -202,11 +260,6 @@ class MotifVQMoE(nn.Module):
         # 基于 batch 内部一致性推断每图 motif 数，避免 DataLoader 拼接歧义
         inferred_counts = _infer_num_motifs_per_graph(data.motif_id, data.batch)
         num_global_motifs = int(inferred_counts.sum().item())
-        # motif_target（显式几何标签）在预训练是必须的
-        assert hasattr(data, 'motif_target') and int(data.motif_target.size(0)) == num_global_motifs
-        assert int(data.motif_target.size(1)) == self.geom_dim, (
-            f"geom_dim mismatch: data={int(data.motif_target.size(1))} vs cfg.model.geom_dim={self.geom_dim}"
-        )
         # 在批次内，确保 motif_gidx 索引未越界
         max_gid = int(motif_gidx.max().item())
         min_gid = int(motif_gidx.min().item())
@@ -215,16 +268,55 @@ class MotifVQMoE(nn.Module):
             f"num_global_motifs={num_global_motifs}"
         )
 
-        # Motif pooling：得到无上下文/上下文两路表征
+        # Motif pooling：得到无上下文本体表征
         h_motif_local = self.motif_pool(x_local, motif_gidx, num_global_motifs)
-        h_motif_ctx = self.motif_pool(x_ctx, motif_gidx, num_global_motifs)
+        # MMM：先在 motif 级对本体表征应用 mask，再计算上下文，避免信息泄漏
+        if motif_mask is not None:
+            assert motif_mask.dtype == torch.bool
+            assert motif_mask.dim() == 1 and motif_mask.numel() == h_motif_local.size(0)
+            token = self.mask_token.to(dtype=h_motif_local.dtype, device=h_motif_local.device)
+            h_motif_local = torch.where(
+                motif_mask.view(-1, 1),
+                token.view(1, -1).expand_as(h_motif_local),
+                h_motif_local,
+            )
+        # 构造 motif 级图（批内全局 motif 索引空间），并在 motif 图上做消息传递得到上下文语义
+        assert hasattr(data, 'motif_edge_index'), '预处理必须提供 motif_edge_index'
+        motif_edge_index = data.motif_edge_index
+        # 在 motif 级图上传播，得到“邻居 motif 语义”（带边语义 + 邻居类型嵌入）
+        # 邻居类型与附件位置嵌入（逐边提供 src/dst 的局部索引；作为受约束的 2D 上下文）
+        assert hasattr(data, 'motif_edge_neighbor_type'), '预处理必须提供 motif_edge_neighbor_type'
+        assert hasattr(data, 'motif_edge_attach_pos_src'), '预处理必须提供 motif_edge_attach_pos_src'
+        assert hasattr(data, 'motif_edge_attach_pos_dst'), '预处理必须提供 motif_edge_attach_pos_dst'
+        nb_type = data.motif_edge_neighbor_type.long()
+        nb_emb = self.neighbor_type_emb(nb_type)
+        # 逐边附件位置（预处理直接提供）
+        att_src = data.motif_edge_attach_pos_src.long()
+        att_dst = data.motif_edge_attach_pos_dst.long()
+        if att_src.numel() > 0:
+            assert int(att_src.min().item()) >= 0 and int(att_src.max().item()) < self.attach_pos_vocab
+            assert int(att_dst.min().item()) >= 0 and int(att_dst.max().item()) < self.attach_pos_vocab
+        att_emb_src = self.attach_pos_emb(att_src)
+        att_emb_dst = self.attach_pos_emb(att_dst)
+        edge_attr_cat = torch.cat([data.motif_edge_attr, nb_emb, att_emb_src, att_emb_dst], dim=-1)
+
+        assert motif_edge_index.dim() == 2 and motif_edge_index.size(0) == 2
+        # if motif_edge_index.numel() > 0:
+        #     mx = int(motif_edge_index.max().item())
+        #     mn = int(motif_edge_index.min().item())
+        #     assert 0 <= mn and mx < num_global_motifs, \
+        #         f"batched motif_edge_index out of bounds: min={mn}, max={mx}, num_global_motifs={num_global_motifs}"
+
+        h_motif_ctx = self.gin_motif_ctx(h_motif_local, motif_edge_index, edge_attr_cat)
         assert h_motif_local.shape == (num_global_motifs, self.hidden)
         assert h_motif_ctx.shape == (num_global_motifs, self.hidden)
 
         # Teacher（仅在预训练启用），输出到 D 维
         teacher_z = None
+        template_z = None
         if self.teacher_enabled:
             assert hasattr(data, 'pos'), 'teacher.enabled=True 但 batch 中无 pos'
+            assert hasattr(data, 'atom_local_coord'), 'template supervision requires atom_local_coord in batch'
             with torch.cuda.amp.autocast(enabled=False):
                 z_i64 = data.z  # long 不受 autocast 影响
                 pos_f32 = data.pos.float()
@@ -236,152 +328,122 @@ class MotifVQMoE(nn.Module):
                 h_motif_local_t = torch.cat([mu, var], dim=-1)
                 tz = self.teacher_proj(h_motif_local_t)
                 teacher_z = tz
+                # 模板教师：只看 motif 内局部坐标，并按 motif_gidx 将原子聚合回 motif。
+                local_pos_f32 = data.atom_local_coord.float()
+                h_atom_template = self.teacher(z_i64, local_pos_f32, motif_gidx)
+                mu_template = self.motif_pool(h_atom_template, motif_gidx, num_global_motifs)
+                e2_template = self.motif_pool(h_atom_template * h_atom_template, motif_gidx, num_global_motifs)
+                var_template = torch.clamp(e2_template - mu_template * mu_template, min=0.0)
+                h_motif_template = torch.cat([mu_template, var_template], dim=-1)
+                template_z = self.teacher_proj(h_motif_template)
 
-        # MMM：将被 mask 的 motifs 的 2D 表征替换为 mask_token（非就地，显式对齐 dtype/device）
-        if motif_mask is not None:
-            assert motif_mask.dtype == torch.bool
-            assert motif_mask.dim() == 1 and motif_mask.numel() == h_motif_local.size(0)
-            token = self.mask_token.to(dtype=h_motif_local.dtype, device=h_motif_local.device)
-            h_motif_local = torch.where(
-                motif_mask.view(-1, 1),
-                token.view(1, -1).expand_as(h_motif_local),
-                h_motif_local,
-            )
+        # 标准 VQ：连续 encoder latent 经过最近邻量化进入 codebook。
+        z_e = self.vq_proj(h_motif_local)
+        codes = self.codebook.codes
+        with torch.cuda.amp.autocast(enabled=False):
+            z_e_f = z_e.float()
+            codes_f = codes.float()
+            z2 = (z_e_f * z_e_f).sum(dim=-1, keepdim=True)
+            c2 = (codes_f * codes_f).sum(dim=-1).view(1, -1)
+            dist_sq = z2 + c2 - 2.0 * z_e_f.matmul(codes_f.t())
+            dist_sq = torch.clamp(dist_sq, min=0.0)
+        logits_code = -dist_sq
+        p_code_soft = F.softmax(logits_code / max(self.router_tau, 1e-8), dim=-1)
+        code_idx = torch.argmin(dist_sq, dim=-1)
+        p_code = F.one_hot(code_idx, num_classes=self.codebook_size).to(z_e.dtype)
+        z_q = self.codebook.lookup(code_idx)
+        # Straight-through quantization：前向用离散 code，反向沿 encoder latent 传梯度。
+        e_hat = z_e + (z_q - z_e).detach()
 
-        # Prototype 路由（仅看 2D latent）
-        # 原型路由仅看无上下文的 h_motif_local
-        logits_code = self.proto_router(h_motif_local)
-        p_code_soft = F.softmax(logits_code, dim=-1)
-        # Top‑K 选择（原型侧）：前向仅由被选中的 code 组成，反向经由软分布
-        k_proto = min(self.proto_topk, self.codebook_size)
-        assert k_proto >= 1, 'proto_topk must be >= 1'
-        vals, idx = torch.topk(p_code_soft, k=k_proto, dim=-1)
-        y_hard = torch.zeros_like(p_code_soft)
-        if k_proto == 1:
-            y_hard.scatter_(1, idx, 1.0)
-        else:
-            # 仅在被选中的 top‑k 内按相对强度加权，保证 e_hat 不退化为全局均值
-            y_hard.scatter_(1, idx, vals / vals.sum(dim=-1, keepdim=True))
-        # Straight‑Through: 前向= y_hard，反向= y_soft
-        y_code = p_code_soft + (y_hard - p_code_soft).detach()
-        # 原型记忆信号（ST）
-        e_hat = y_code @ self.codebook.codes  # [N,D]
-
-        # Expert 路由与稀疏选通
-        # 专家路由仅看上下文表征
+        # Expert 路由仅用于负载约束（可选）；Δ 由邻居定向边聚合产生
         logits_exp = self.expert_router(h_motif_ctx)
         p_exp = F.softmax(logits_exp, dim=-1)
-        k = self.expert_topk
-        exp_vals, exp_idx = torch.topk(p_exp, k=k, dim=-1)
-        exp_vals_norm = exp_vals / exp_vals.sum(dim=-1, keepdim=True)
-        # 计算每个选中 expert 的输出并加权
-        expert_inputs = torch.cat([h_motif_ctx, e_hat], dim=-1)
-        deltas: List[torch.Tensor] = []
-        for j in range(k):
-            ej_idx = exp_idx[:, j]
-            # 收集对应 expert 的输出
-            parts = []
-            for i in range(self.num_experts):
-                sel = (ej_idx == i)
-                if sel.any():
-                    out_i = self.experts[i](expert_inputs[sel])
-                    parts.append((sel, out_i))
-            # 重组为完整顺序张量
-            delta_j = torch.zeros_like(h_motif_ctx)
-            for sel, val in parts:
-                delta_j[sel] = val
-            deltas.append(delta_j)
-        # 加权求和（得到 Δ_raw）
-        delta = torch.zeros_like(h_motif_ctx)
-        for j in range(k):
-            wj = exp_vals_norm[:, j].view(-1, 1)
-            delta = delta + wj * deltas[j]
 
-        # MoE 增强后的表示（以 e_hat 为主，Δ 受缩放）
-        delta_scaled = self.delta_scale * delta
+        # 邻居定向 Δ：对每条 motif 边（u->v）计算边级残差并对同一 u 聚合（softmax 权重）。
+        # 这条支路只读取 stop-grad 的离散模板，避免 edge 监督直接改写 VQ 主链。
+        eidx = motif_edge_index  # [2, E]
+        if eidx.numel() > 0:
+            src = eidx[0]
+            # 边语义直接参与训练；仅模板侧保留 stop-grad，避免 edge 监督直接改写 VQ 主链。
+            e_attr = self.ctx_dropout(edge_attr_cat)
+            proto_src = z_q.detach().index_select(0, src)
+            edge_in = torch.cat([proto_src, e_attr], dim=-1)
+            edge_delta = self.edge_delta_mlp(edge_in)  # [E,D]
+            gate_logits = self.edge_gate_mlp(edge_in).squeeze(-1)  # [E]
+            # softmax over edges group by src
+            max_per_src, _ = scatter_max(gate_logits, src, dim=0, dim_size=num_global_motifs)
+            max_g = max_per_src.index_select(0, src)
+            y = torch.exp(gate_logits - max_g)
+            sum_per_src = scatter_add(y, src, dim=0, dim_size=num_global_motifs)
+            denom = sum_per_src.index_select(0, src) + 1e-12
+            alpha = (y / denom).unsqueeze(-1)  # [E,1]
+            # 监督和最终注入的 latent 使用同一缩放，避免 edge 支路目标与主链注入量不一致。
+            edge_delta_scaled = self.delta_scale * edge_delta
+            delta_edge = scatter_add(alpha * edge_delta_scaled, src, dim=0, dim_size=num_global_motifs)
+            edge_delta_geom = self.latent_to_edge(edge_delta_scaled)
+        else:
+            delta_edge = torch.zeros_like(h_motif_local)
+            edge_delta_geom = torch.zeros((0, self.edge_target_dim), device=h_motif_local.device, dtype=h_motif_local.dtype)
+
+        # 上下文补充分支：从 h_ctx 中剥离与 local/codebook 平行的成分，得到 unique(ctx, local)。
+        # h_ctx 直接参与训练；仅模板基底保留 stop-grad，确保 ctx 只补偏移、不反向拖动 local 原型。
+        ctx_q = self.ctx_query(self.ctx_dropout(h_motif_ctx))
+        code_basis = self.ctx_code(e_hat.detach())
+        denom = (code_basis * code_basis).sum(dim=-1, keepdim=True) + 1e-12
+        coeff = (ctx_q * code_basis).sum(dim=-1, keepdim=True) / denom
+        ctx_parallel = coeff * code_basis
+        ctx_unique = ctx_q - ctx_parallel
+        delta_ctx = self.ctx_delta_mlp(ctx_unique)
+
+        # 最终 ctx 由 unique(ctx, local) 与边语义两路偏移经可学习门控融合得到。
+        delta_ctx_scaled = self.ctx_delta_scale * delta_ctx
+        ctx_fuse_in = torch.cat([delta_ctx_scaled, delta_edge], dim=-1)
+        ctx_fuse_weight = torch.sigmoid(self.ctx_fuse_gate(ctx_fuse_in))
+        delta_scaled = ctx_fuse_weight * delta_ctx_scaled + (1.0 - ctx_fuse_weight) * delta_edge
         h_motif_enh = e_hat + delta_scaled
 
-        # 几何 GT 及其投影到 latent
-        # 定义“模板目标”：从几何 GT 的 latent 中减去上下文修正（Δ）在 latent 空间的贡献
-        # 冻结期模板目标不应受 Δ 分支影响
-        z3d_gt = data.motif_target.float()
-        zgt_proj = self.zgt_to_latent(z3d_gt)
-        with torch.cuda.amp.autocast(enabled=False):
-            delta_for_tpl = torch.zeros_like(delta_scaled) if freeze_delta else delta_scaled.detach()
-            z_template = zgt_proj.float() - delta_for_tpl.float()
-            z2 = (z_template * z_template).sum(dim=1, keepdim=True)
-            c2 = (self.codebook.codes * self.codebook.codes).sum(dim=1).view(1, -1)
-            d2_tpl = z2 + c2 - 2.0 * z_template.matmul(self.codebook.codes.t())
-            p_gt = F.softmax(-d2_tpl / max(self.gt_temperature, 1e-8), dim=-1)
-            gt_nn_index = torch.argmin(d2_tpl, dim=-1)
+        # 边级监督目标（标准化后）
+        edge_target = data.motif_edge_target.float()
 
-        # 几何重建（从增强后 latent 回归回几何标签空间）与原型解码（仅用于监控）
-        z_pred = self.latent_to_zgt(h_motif_enh)
-        z_proto = self.latent_to_zgt(e_hat)
-
-        # 冻结 Δ：仅让原型生效（影响所有调用者，包括主链路与辅助分支）
-        if freeze_delta:
-            delta_out = torch.zeros_like(e_hat)
-            h_motif_enh = e_hat
-            z_pred = z_proto
-        else:
-            delta_out = delta_scaled
-
-        # 教师分布 p_t（仅在启用教师时计算）：仅作为可选参考，不作为主监督
-        p_t = None
-        teacher_nn_index = None
-        if teacher_z is not None:
-            with torch.cuda.amp.autocast(enabled=False):
-                t = teacher_z.float()
-                t2 = (t * t).sum(dim=1, keepdim=True)
-                c2 = (self.codebook.codes * self.codebook.codes).sum(dim=1).view(1, -1)
-                d2_t = t2 + c2 - 2.0 * t.matmul(self.codebook.codes.t())
-                p_t = F.softmax(-d2_t / self.teacher_temperature, dim=-1)
-                teacher_nn_index = torch.argmin(d2_t, dim=-1)
+        delta_out = delta_scaled
+        delta_edge_out = delta_edge
+        delta_ctx_out = delta_ctx_scaled
 
         router_info: Dict[str, torch.Tensor] = {
-            'p_code': y_code,
+            'p_code': p_code,
             'p_code_soft': p_code_soft,
             'logits_code': logits_code,
             'p_exp': p_exp,
             'logits_exp': logits_exp,
-            'exp_topk_idx': exp_idx,
             'codebook_codes': self.codebook.codes,
+            'code_idx': code_idx,
+            'z_e': z_e,
+            'z_q': z_q,
             'e_hat': e_hat,
             'h_motif_enh': h_motif_enh,
             'h_motif_local': h_motif_local,
             'h_motif_ctx': h_motif_ctx,
-            # 显式几何标签与其投影
-            'z3d_gt': z3d_gt,
-            'zgt_proj': zgt_proj,
-            'z_template': z_template,
-            'p_gt': p_gt,
-            'gt_nn_index': gt_nn_index,
-            'z_pred': z_pred,
-            'z_proto': z_proto,
+            'ctx_unique': ctx_unique,
+            'ctx_fuse_weight': ctx_fuse_weight,
+            # 边级监督
+            'edge_target': edge_target,
+            'edge_delta_geom': edge_delta_geom,
         }
-        if p_t is not None:
-            router_info['aux_teacher_p'] = p_t
-        if teacher_nn_index is not None:
-            router_info['aux_teacher_nn_index'] = teacher_nn_index
-        if teacher_z is not None:
-            router_info['aux_teacher_z'] = teacher_z
-        # 兼容旧日志键（使用 soft 分布作为 y_soft）
-        router_info['y_soft'] = p_code_soft
-        # 导出原型与专家的选通信息与残差
-        router_info['proto_topk_idx'] = idx
         router_info['delta'] = delta_out
-        router_info['e_hat'] = e_hat
+        router_info['delta_edge'] = delta_edge_out
+        router_info['delta_ctx'] = delta_ctx_out
+        if teacher_z is not None:
+            router_info['z3d_target'] = teacher_z
+            router_info['z3d_pred'] = self.main_3d_head(h_motif_enh)
+        if template_z is not None:
+            router_info['z_template_target'] = template_z
 
         # 兼容返回形状：首个返回值用于 batch 大小统计，直接返回 h_motif_local
         return h_motif_local, h_motif_enh, router_info
 
-    def set_topk(self, k: int) -> None:
-        # 仅影响专家路由的 top-k
-        self.expert_topk = int(k)
-
-    def set_proto_topk(self, k: int) -> None:
-        self.proto_topk = int(k)
+    def set_router_temperature(self, tau: float) -> None:
+        # 仅影响按距离得到的软分布诊断，不改变最近邻硬量化。
+        self.router_tau = float(tau)
 
     def readout(self, h_motif: torch.Tensor, motif_gidx: torch.Tensor, num_graphs: int) -> torch.Tensor:
         # 将 motif 特征聚合为分子级表示

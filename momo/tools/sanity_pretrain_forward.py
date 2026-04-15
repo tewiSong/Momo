@@ -19,7 +19,7 @@ def main():
 
     ds = PCQM4Mv2MotifDataset(
         preprocessed_path=cfg['dataset']['preprocessed_path'],
-        z3d_dim=cfg['model']['geom_dim'],
+        z3d_dim=int(cfg['model'].get('edge_target_dim', 7)),
         max_atomic_num=cfg['dataset']['max_atomic_num'],
         require_pos=bool(cfg.get('teacher', {}).get('enabled', False)),
     )

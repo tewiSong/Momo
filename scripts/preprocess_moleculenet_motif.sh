@@ -25,9 +25,9 @@ echo "DATASETS=${DATASETS}"
 echo "LIMIT=${LIMIT}"
 echo "ATTACH_Y=${ATTACH_Y}"
 
-/ibex/user/songt/conda_envs/momo/bin/python -m momo.tools.preprocess_moleculenet_motif \
-  --root "${DATA_ROOT}" \
-  --list "${DATASETS}" \
+# 统一使用新版预处理入口，生成与预训练一致的字段（motif 图 + 完整目标）
+/ibex/user/songt/conda_envs/momo/bin/python -m momo.tools.preprocess_pcqm4mv2 \
+  --molnet-root "${DATA_ROOT}" \
+  --molnet-list "${DATASETS}" \
   --limit "${LIMIT}" \
-  $( [[ "$ATTACH_Y" == "1" ]] && echo "--attach-y" )
-
+  $( [[ "$ATTACH_Y" == "1" ]] && echo "--molnet-attach-y" )

@@ -8,51 +8,38 @@ dataset:
 
 model:
   hidden_dim: 256
-  geom_dim: 7
+  edge_target_dim: 7
   num_gin_layers: 5
   gin_mlp_hidden: 256
   dropout: 0.1
-  z3d_dim: 256          # 保留 teacher 相关设置，但主监督使用 geom_dim 的显式几何标签
+  z3d_dim: 256          # teacher 主干 hidden（不再作为监督维度）
   codebook_size: 128
   expert_mlp_hidden: 256
   num_experts: 8        # 独立 expert 数量（MoE）
   readout: sum          # sum 或 attention
   delta_scale: 0.2      # 固定缩放 γ，限制 Δ 的容量
-  delta_freeze_steps: 60000  # 训练前期冻结 Δ，使原型先收敛
+  ctx_delta_scale: 0.1  # 弱上下文补充分支，只负责 edge_delta 表达不了的剩余信息
+  ctx_delta_bottleneck: 64
+  motif_edge_dim: 8
+  neighbor_type_vocab_size: 1000000
+  neighbor_type_emb_dim: 16
   codebook_init:
-    name: kmeans        # 几何→latent 投影后做 k-means 初始化 codebook
+    name: kmeans        # 对 teacher motif latent（无 teacher 时退化为 encoder latent）做 k-means 初始化 codebook
     sample_size: 200000
     max_iters: 30
     tol: 1.0e-4
 
 loss:
-  recon_weight: 1.0
-  proto_recon_weight: 0.3
+  edge_weight: 0.5
+  main_3d_weight: 1.0
+  template_weight: 1.0
   vq_weight: 0.25
   commit_weight: 0.25
-  commit_ramp_steps: 200000   # 进一步放缓早期绑定，避免过早锁定少数码
-  # 路由监督与正则
-  kl_weight: 0.10
-  ce_weight: 0.02
-  ent_weight: 0.01
-  balance_weight: 0.005
-  exp_balance_weight: 0.002
-  # 任务项
-  mmm_weight: 1.0
-  graph_weight: 0.1
-  # Δ 正则
+  commit_ramp_steps: 200000
   delta_l2_weight: 0.001
-  delta_res_weight: 0.5
   orth_weight: 0.02
-  # 0319: 为探索相关项加入“后期退火”调度（避免长期过均匀导致聚类弱、收敛慢）
-  ent_schedule:
-    start_step: 300000
-    duration: 100000
-    end_weight: 0.005
-  balance_schedule:
-    start_step: 300000
-    duration: 100000
-    end_weight: 0.003
+  ctx_delta_l2_weight: 0.001
+  ctx_delta_orth_weight: 0.02
 
 optim:
   lr: 1e-3
@@ -79,43 +66,18 @@ scheduler:
   eta_min: 1.0e-5
 
 router:
-  distance_temperature: 0.5   # p_nn 的温度（越小越尖锐）
-  teacher_temperature: 2.0    # 降低温度，提升 p_t 区分度
-  gt_temperature: 1.0         # 几何投影与 codebook 的分布温度（用于 p_gt），更软以防早期塌缩
-  # 教师温度退火（高→低），更快进入可分原型
+  teacher_temperature: 2.0
   teacher_temperature_start: 2.0
   teacher_temperature_end: 1.2
   teacher_temp_decay_start: 10000
   teacher_temp_decay_steps: 60000
-  gumbel_tau_start: 1.0       # p_r 的初始 Gumbel-Softmax 温度
-  gumbel_tau_end: 0.6         # p_r 的最终温度（略平）
-  beta_start: 0.0             # 融合权重起始（更信教师）
-  beta_end: 0.5               # 融合权重终值（不过早完全依赖路由）
-  warmup_steps: 50000         # 从 start 线性过渡到 end 的步数
-  topk: 4
-  topk_warmup_steps: 60000    # 提前允许稀疏化
-  expert_topk: 2              # Expert 路由 Top‑K 稀疏选通数
-  # 0319: 晚期将 β 提升到更高，逐步更信路由器
-  beta_boost:
-    start_step: 350000
-    duration: 150000
-    end_beta: 0.60          # 后期“更信路由”力度略降，抑制过硬
-  # 0319: Top‑K 分段调度（期望→Top‑4→Top‑1），帮助进入专化
-  topk_schedule:
-    stage1_until: 80000       # 期望向量（topk=0）
-    stage2_until: 220000      # 进入 Top‑K，延后到 commit 基本稳定
-    stage2_k: 4
-    final_k: 1                # 收敛期 Top‑1 硬化
-  # 训练后期轻微升温 tau_r，提升码本使用度（可选）
+  gumbel_tau_start: 1.0
+  gumbel_tau_end: 0.6
+  warmup_steps: 50000
   tau_r_boost:
-    start_step: 200000        # 提前启动后期软化
-    duration: 100000          # 过渡步数
-    end_tau: 0.60             # 更平的最终温度
-  # 熵目标闭环：将 y_soft 熵维持在健康区间（关闭则设为 0）
-  entropy_target: 2.08      # 目标熵≈ln(8)，稳态有效码≥8
-  entropy_ctrl_lr: 0.0045   # 略快一点的闭环调节
-  tau_r_min: 0.40
-  tau_r_max: 1.50
+    start_step: 200000
+    duration: 100000
+    end_tau: 0.60
 
 teacher:
   enabled: true
@@ -131,13 +93,3 @@ teacher:
   max_num_neighbors: 32
   normalize_messages: true
   activation: shifted_softplus
-
-mmm:
-  mask_ratio: 0.15
-
-graph:
-  mask_ratio_light: 0.15
-  mask_ratio_heavy: 0.30
-  temperature: 0.2
-  loss: tmcl
-  margin: 0.2

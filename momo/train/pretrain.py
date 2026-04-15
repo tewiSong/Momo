@@ -1,7 +1,7 @@
 # momo/train/pretrain.py
 import os
 import argparse
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from datetime import datetime
 import socket
 
@@ -13,7 +13,6 @@ from momo.utils.config import load_yaml
 from momo.data.pcqm4mv2 import PCQM4Mv2MotifDataset
 from momo.models.gin_motif_vqmoe import MotifVQMoE
 from momo.train.losses import compute_losses
-import torch.nn.functional as F
 
 
 def setup_seed(seed: int) -> None:
@@ -21,33 +20,150 @@ def setup_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _reservoir_sample_z3d(ds: PCQM4Mv2MotifDataset, sample_size: int, z3d_dim: int, seed: int) -> torch.Tensor:
-    """Uniformly sample up to `sample_size` motif 3D targets from the dataset using reservoir sampling.
+def _scan_dataset_stats(ds: PCQM4Mv2MotifDataset) -> tuple[int, int, List[bool]]:
+    """Scan dataset once to collect startup diagnostics.
 
-    Returns a CPU float32 tensor of shape [N, z3d_dim].
+    Returns:
+      max_motif_type_id: maximum motif type id found in records
+      zero_edge_total: number of molecules with zero motif edges
+      zero_edge_flags: per-record flag for fast split-level stats
     """
-    import random
+    max_id = 0
+    zero_total = 0
+    zero_flags: List[bool] = []
 
-    random.seed(seed)
-    buf = []
-    seen = 0
     for rec in ds.data:  # type: ignore[attr-defined]
-        feats = rec['motif_features']  # List[List[float]]
-        for v in feats:
-            seen += 1
-            if len(buf) < sample_size:
-                buf.append(v)
+        mei = rec['motif_edge_index']
+        assert isinstance(mei, (list, tuple)) and len(mei) == 2, "motif_edge_index must be a 2-row list"
+        e = len(mei[0])
+        is_zero = (e == 0)
+        zero_flags.append(is_zero)
+        if is_zero:
+            zero_total += 1
+
+        arr = rec['motif_type_id']
+        cur = max(arr) if arr else 0
+        if cur > max_id:
+            max_id = int(cur)
+
+    return int(max_id), int(zero_total), zero_flags
+
+
+def _check_neighbor_type_range(batch, vocab_size: int, where: str) -> None:
+    nb = batch.motif_edge_neighbor_type
+    if nb.numel() == 0:
+        return
+
+    nb_cpu = nb.long().view(-1).cpu()
+    nb_min = int(nb_cpu.min().item())
+    nb_max = int(nb_cpu.max().item())
+    bad = (nb_cpu < 0) | (nb_cpu >= int(vocab_size))
+    if not bad.any():
+        return
+
+    bad_vals = nb_cpu[bad]
+    bad_preview = bad_vals[:16].tolist()
+    parts: List[str] = [
+        f"CPU check failed {where}: motif_edge_neighbor_type out of range",
+        f"min_id={nb_min}",
+        f"max_id={nb_max}",
+        f"vocab_size={int(vocab_size)}",
+        f"bad_count={int(bad.sum().item())}",
+        f"bad_min={int(bad_vals.min().item())}",
+        f"bad_max={int(bad_vals.max().item())}",
+        f"bad_preview={bad_preview}",
+    ]
+
+    assert hasattr(batch, "rec_idx") and hasattr(batch, "num_motifs") and hasattr(batch, "motif_edge_index")
+    rec_idx = batch.rec_idx.view(-1).long().cpu()
+    num_motifs = batch.num_motifs.view(-1).long().cpu()
+    mei = batch.motif_edge_index
+    assert mei.dim() == 2 and mei.size(0) == 2 and mei.size(1) == nb_cpu.numel()
+    assert rec_idx.numel() == num_motifs.numel() and num_motifs.numel() > 0
+    offsets = torch.cumsum(
+        torch.cat([torch.zeros(1, dtype=torch.long), num_motifs], dim=0),
+        dim=0,
+    )
+    src = mei[0].long().view(-1).cpu()
+    edge_graph = torch.bucketize(src, offsets[1:], right=True)
+    bad_graph = torch.unique(edge_graph[bad], sorted=True)
+    bad_rec = rec_idx[bad_graph]
+    parts.append(f"bad_rec_idx={bad_rec[:16].tolist()}")
+
+    raise AssertionError(" | ".join(parts))
+
+
+def _collect_code_init_latents(model: MotifVQMoE, dl: DataLoader, sample_size: int, device: str) -> torch.Tensor:
+    """Collect up to sample_size latent targets across batches for k-means init.
+    在 CPU 上先检查 batch 后的 motif graph，再搬到 GPU，避免 CUDA 越界难定位。
+    """
+    zs: list[torch.Tensor] = []
+    total = 0
+    model.eval()
+
+    with torch.no_grad():
+        for batch in dl:
+            # ---------- CPU check before batch.to(device) ----------
+            assert hasattr(batch, 'num_motifs')
+            assert hasattr(batch, 'motif_edge_index')
+            assert hasattr(batch, 'motif_edge_attr')
+            assert hasattr(batch, 'motif_edge_neighbor_type')
+            assert hasattr(batch, 'motif_edge_attach_pos_src')
+            assert hasattr(batch, 'motif_edge_attach_pos_dst')
+
+            num_motifs_total = int(batch.num_motifs.sum().item())
+            mei = batch.motif_edge_index  # still on CPU
+
+            assert mei.dim() == 2 and mei.size(0) == 2, \
+                f"motif_edge_index must be [2, E], got {tuple(mei.shape)}"
+
+            E = int(mei.size(1))
+            if E > 0:
+                mx = int(mei.max().item())
+                mn = int(mei.min().item())
+                assert 0 <= mn and mx < num_motifs_total, (
+                    f"CPU check failed in kmeans init: motif_edge_index out of bounds: "
+                    f"min={mn}, max={mx}, num_motifs_total={num_motifs_total}, E={E}"
+                )
+
+                assert batch.motif_edge_attr.size(0) == E, (
+                    f"motif_edge_attr rows {batch.motif_edge_attr.size(0)} != E {E}"
+                )
+                assert batch.motif_edge_neighbor_type.numel() == E, (
+                    f"motif_edge_neighbor_type len {batch.motif_edge_neighbor_type.numel()} != E {E}"
+                )
+                assert batch.motif_edge_attach_pos_src.numel() == E, (
+                    f"motif_edge_attach_pos_src len {batch.motif_edge_attach_pos_src.numel()} != E {E}"
+                )
+                assert batch.motif_edge_attach_pos_dst.numel() == E, (
+                    f"motif_edge_attach_pos_dst len {batch.motif_edge_attach_pos_dst.numel()} != E {E}"
+                )
+
+                _check_neighbor_type_range(batch, int(model.neighbor_type_vocab), "in kmeans init")
             else:
-                j = random.randrange(seen)
-                if j < sample_size:
-                    buf[j] = v
-    if len(buf) == 0:
-        raise RuntimeError('No motif_features found in dataset for k-means init')
-    X = torch.tensor(buf, dtype=torch.float32)
-    assert X.dim() == 2 and X.size(1) == z3d_dim, f"Unexpected z3d_dim: got {X.size(1)}, expect {z3d_dim}"
-    # 标准化到与训练一致的空间
-    X = (X - ds.z3d_mean.cpu()) / ds.z3d_std.cpu()
-    return X
+                # empty-edge samples must still have consistent empty tensors
+                assert batch.motif_edge_attr.size(0) == 0
+                assert batch.motif_edge_neighbor_type.numel() == 0
+                assert batch.motif_edge_attach_pos_src.numel() == 0
+                assert batch.motif_edge_attach_pos_dst.numel() == 0
+            # ------------------------------------------------------
+
+            batch = batch.to(device)
+            _, _, info = model(batch)
+            src = info['z_template_target'] if 'z_template_target' in info else (info['z3d_target'] if 'z3d_target' in info else info['z_e'])
+            z = src.detach().cpu().to(torch.float32)
+            zs.append(z)
+            total += z.size(0)
+            if total >= sample_size:
+                break
+
+    if not zs:
+        raise RuntimeError('Failed to collect latents for k-means init')
+
+    Z = torch.cat(zs, dim=0)
+    if Z.size(0) > sample_size:
+        Z = Z[:sample_size]
+    return Z
 
 
 def _kmeans_torch(X: torch.Tensor, K: int, max_iters: int = 30, tol: float = 1e-4, seed: int = 42) -> torch.Tensor:
@@ -58,14 +174,9 @@ def _kmeans_torch(X: torch.Tensor, K: int, max_iters: int = 30, tol: float = 1e-
     """
     assert X.device.type == 'cpu'
     N, D = X.size(0), X.size(1)
+    assert N >= K, f"k-means init requires at least K samples, got N={N}, K={K}"
     g = torch.Generator(device='cpu').manual_seed(seed)
-    if N < K:
-        # If points fewer than clusters, pad with repeated samples
-        idx = torch.arange(N)
-        reps = (K + N - 1) // N
-        idx = idx.repeat(reps)[:K]
-    else:
-        idx = torch.randperm(N, generator=g)[:K]
+    idx = torch.randperm(N, generator=g)[:K]
     C = X[idx].clone()  # [K, D]
 
     prev_C = C.clone()
@@ -92,11 +203,8 @@ def _kmeans_torch(X: torch.Tensor, K: int, max_iters: int = 30, tol: float = 1e-
             if cnt > 0:
                 C[k] = X[mask].mean(dim=0)
                 counts[k] = cnt
-        # Handle empty clusters by re-seeding to random points
         empty = (counts == 0).nonzero(as_tuple=False).view(-1)
-        if empty.numel() > 0:
-            ridx = torch.randperm(N, generator=g)[:empty.numel()]
-            C[empty] = X[ridx]
+        assert empty.numel() == 0, f"k-means produced empty clusters: {empty.tolist()}"
 
         # Check convergence via centroid shift
         shift = torch.norm(C - prev_C, p=2) / (torch.norm(prev_C, p=2) + 1e-12)
@@ -112,7 +220,7 @@ def eval_epoch(model: torch.nn.Module,
                loss_cfg: Dict[str, float]) -> Dict[str, float]:
     model.eval()
     tot = 0
-    sums = {k: 0.0 for k in ['loss', 'recon', 'proto_recon', 'delta_res', 'orth', 'vq', 'commit', 'kl', 'ce', 'ent', 'balance', 'geom_align', 'exp_balance', 'delta_l2']}
+    sums = {k: 0.0 for k in ['loss', 'edge', 'main_3d', 'template', 'vq', 'commit', 'orth', 'delta_l2', 'ctx_delta_l2', 'ctx_delta_orth']}
     with torch.no_grad():
         for batch in dl:
             batch = batch.to(device)
@@ -162,21 +270,42 @@ def main():
     # Dataset and split
     ds = PCQM4Mv2MotifDataset(
         preprocessed_path=cfg['dataset']['preprocessed_path'],
-        z3d_dim=cfg['model']['geom_dim'],
+        z3d_dim=int(cfg['model'].get('edge_target_dim', 7)),
         max_atomic_num=cfg['dataset']['max_atomic_num'],
         require_pos=bool(cfg.get('teacher', {}).get('enabled', False)),
     )
     print(f"Loaded dataset from {cfg['dataset']['preprocessed_path']} with {len(ds)} molecules")
-    assert int(ds.z3d_dim) == int(cfg['model']['geom_dim']), (
-        f"geom_dim mismatch: dataset={int(ds.z3d_dim)} vs cfg.model.geom_dim={int(cfg['model']['geom_dim'])}"
+    # Single-pass startup scan: max motif type id + zero-edge flags.
+    max_motif_type_id = 0
+    zero_flags: List[bool] = []
+    total = len(ds)
+    max_motif_type_id, zero_total, zero_flags = _scan_dataset_stats(ds)
+    pct = (100.0 * zero_total / max(1, total))
+    print(f"Zero-motif-edge molecules: {zero_total}/{total} ({pct:.2f}%)")
+    assert int(ds.edge_target_dim) == int(cfg['model'].get('edge_target_dim', 7)), (
+        f"edge dims mismatch: dataset={int(ds.edge_target_dim)} vs cfg={int(cfg['model'].get('edge_target_dim', 7))}"
     )
-
+    cfg_vocab = int(cfg['model']['neighbor_type_vocab_size'])
+    assert cfg_vocab > max_motif_type_id, (
+        f"model.neighbor_type_vocab_size ({cfg_vocab}) must be greater than "
+        f"max motif_type_id in preprocessed data ({max_motif_type_id})"
+    )
     val_ratio = float(cfg['dataset'].get('val_ratio', 0.05))
     n_total = len(ds)
     n_val = max(1, int(round(n_total * val_ratio)))
     n_train = n_total - n_val
     gen = torch.Generator().manual_seed(int(cfg['misc'].get('seed', 42)))
     train_ds, val_ds = torch.utils.data.random_split(ds, [n_train, n_val], generator=gen)
+    # Per-split zero-edge ratio
+    ti = train_ds.indices  # type: ignore[attr-defined]
+    vi = val_ds.indices    # type: ignore[attr-defined]
+    assert len(zero_flags) == len(ds)
+    zero_train = sum(1 for i in ti if zero_flags[i])
+    zero_val = sum(1 for i in vi if zero_flags[i])
+    pct_tr = (100.0 * zero_train / max(1, len(ti)))
+    pct_va = (100.0 * zero_val / max(1, len(vi)))
+    print(f"Zero-motif-edge (train): {zero_train}/{len(ti)} ({pct_tr:.2f}%)")
+    print(f"Zero-motif-edge (val):   {zero_val}/{len(vi)} ({pct_va:.2f}%)")
 
     dl_train = DataLoader(
         train_ds,
@@ -195,6 +324,7 @@ def main():
     init_cfg = cfg['model'].get('codebook_init', {})
     init_name = str(init_cfg.get('name', 'random')).lower()
     kmeans_centroids = None
+    assert bool(cfg.get('teacher', {}).get('enabled', False)), 'teacher.enabled must be true for main 3D supervision'
 
     model = MotifVQMoE(cfg).to(device)
     # 冻结/解冻 teacher 参数：从根源修复需先把 teacher 约束到 z_gt，同期避免其不稳定牵动主干
@@ -207,16 +337,15 @@ def main():
     if hasattr(model, 'teacher_proj') and model.teacher_proj is not None:
         for p in model.teacher_proj.parameters():
             p.requires_grad = proj_trainable
-    # Codebook 初始化（基于几何投影到 latent 的 k-means）
+    # Codebook 初始化：对目标几何 latent（teacher）或 encoder latent 做 k-means。
     if init_name == 'kmeans':
         sample_size = int(init_cfg.get('sample_size', 200000))
         max_iters = int(init_cfg.get('max_iters', 30))
         tol = float(init_cfg.get('tol', 1e-4))
         seed = int(cfg['misc'].get('seed', 42))
-        print(f"[Init] Collecting up to {sample_size} z3d_gt samples for k-means (projected to latent)...")
-        X = _reservoir_sample_z3d(ds, sample_size, int(ds.z3d_dim), seed)  # [N, geom_dim]
-        with torch.no_grad():
-            Z = model.zgt_to_latent(X.to(device)).detach().cpu().to(torch.float32)
+        print(f"[Init] Collecting up to {sample_size} latent targets for k-means...")
+        Z = _collect_code_init_latents(model, dl_train, sample_size, device)
+        
         K = int(cfg['model']['codebook_size'])
         N_eff = Z.size(0)
         print(f"[Init] Running k-means on {N_eff} projected samples into {K} clusters (iters={max_iters}, tol={tol})")
@@ -269,41 +398,16 @@ def main():
     log_every = int(cfg['misc'].get('log_every_steps', 50))
     eval_every = int(cfg['misc'].get('eval_every_epochs', 1))
     eval_every_steps = int(cfg['misc'].get('eval_every_steps', 0))  # 0 表示按 epoch 评估
-    # 两阶段训练：前期冻结 Δ（严格要求在配置中提供步数）
-    delta_freeze_steps = int(cfg['model']['delta_freeze_steps'])
 
-    # 基本权重与简化调度（仅保留 commit 升温与熵/均衡后期退火）
+    # 基本权重与调度（仅保留 commit 升温）
     loss_base = dict(cfg['loss'])
-    # commit 权重线性升温步数（避免早期强绑定码本）
     commit_ramp_steps = int(cfg.get('loss', {}).get('commit_ramp_steps', 50000))
-
-    def _apply_weight_schedule(base_w: float, sched: Dict[str, float], step: int) -> float:
-        """线性调度辅助：从 base_w 过渡到 sched['end_weight']，
-        在 sched['start_step'] 开始、历时 sched['duration'] 步完成。若未提供则返回 base_w。
-        """
-        if not isinstance(sched, dict):
-            return float(base_w)
-        end_w = float(sched.get('end_weight', base_w))
-        start = int(sched.get('start_step', -1))
-        dur = int(sched.get('duration', 0))
-        if start < 0 or dur <= 0:
-            return float(base_w)
-        if step <= start:
-            return float(base_w)
-        p = min(1.0, max(0.0, float(step - start) / float(dur)))
-        return float(base_w) + (end_w - float(base_w)) * p
 
     def current_weights(step: int):
         w = dict(loss_base)
-        # commit 权重升温
         if commit_ramp_steps > 0:
             p_commit = min(1.0, float(step) / float(commit_ramp_steps))
             w['commit_weight'] = float(loss_base.get('commit_weight', 0.0)) * p_commit
-        # 熵/均衡后期退火
-        ent_base = float(loss_base.get('ent_weight', 0.0))
-        bal_base = float(loss_base.get('balance_weight', 0.0))
-        w['ent_weight'] = _apply_weight_schedule(ent_base, cfg['loss'].get('ent_schedule', {}), step)
-        w['balance_weight'] = _apply_weight_schedule(bal_base, cfg['loss'].get('balance_schedule', {}), step)
         return w
 
     # 路由调度参数（必须配置，不做静默回退）
@@ -311,46 +415,18 @@ def main():
     assert rcfg is not None, 'router 配置缺失'
     tau_r_start = float(rcfg['gumbel_tau_start'])
     tau_r_end = float(rcfg['gumbel_tau_end'])
-    beta_start = float(rcfg['beta_start'])
-    beta_end = float(rcfg['beta_end'])
     warmup_steps = int(rcfg['warmup_steps'])
-    topk_warmup_steps = int(rcfg.get('topk_warmup_steps', 0))
     # 可选：教师温度退火（高→低），以及晚期将 β 提升到更大值（保留，但不强制要求 teacher）
     tt_start = float(rcfg.get('teacher_temperature_start', rcfg.get('teacher_temperature', 1.0)))
     tt_end = float(rcfg.get('teacher_temperature_end', tt_start))
     tt_decay_start = int(rcfg.get('teacher_temp_decay_start', -1))
     tt_decay_steps = int(rcfg.get('teacher_temp_decay_steps', 0))
-    beta_boost = rcfg.get('beta_boost', None)
-    beta_boost_start = int(beta_boost.get('start_step', -1)) if isinstance(beta_boost, dict) else -1
-    beta_boost_dur = int(beta_boost.get('duration', 0)) if isinstance(beta_boost, dict) else 0
-    beta_boost_end = float(beta_boost.get('end_beta', beta_end)) if isinstance(beta_boost, dict) else beta_end
 
     # 可选：训练后期提升 tau_r 的二阶段调度，提升码本使用度
     boost_cfg = rcfg.get('tau_r_boost', None)
     boost_start = int(boost_cfg.get('start_step', -1)) if isinstance(boost_cfg, dict) else -1
     boost_dur = int(boost_cfg.get('duration', 0)) if isinstance(boost_cfg, dict) else 0
     boost_end_tau = float(boost_cfg.get('end_tau', tau_r_end)) if isinstance(boost_cfg, dict) else tau_r_end
-
-    # Prototype Top‑K 调度（仅保留 ST 硬/软混合，前向只用被选 codes）
-    proto_sched = rcfg.get('topk_schedule', None)
-    if isinstance(proto_sched, dict):
-        stage1_until = int(proto_sched.get('stage1_until', -1))
-        stage2_until = int(proto_sched.get('stage2_until', -1))
-        stage2_k = int(proto_sched.get('stage2_k', rcfg.get('topk', 1)))
-        final_k = int(proto_sched.get('final_k', 1))
-        assert stage2_k >= 1 and final_k >= 1, 'proto top-k must be >=1'
-    else:
-        stage1_until = -1
-        stage2_until = -1
-        stage2_k = int(rcfg.get('topk', 1))
-        final_k = stage2_k
-
-    # 熵目标闭环控制参数（可选）
-    ent_target = float(rcfg.get('entropy_target', 0.0))  # 0 表示关闭
-    ent_ctrl_lr = float(rcfg.get('entropy_ctrl_lr', 0.0))
-    tau_r_min = float(rcfg.get('tau_r_min', 0.4))
-    tau_r_max = float(rcfg.get('tau_r_max', 1.5))
-    tau_r_state = None  # 维护一个持久化的 tau_r 状态，避免每步被基线调度完全覆盖
 
     # AMP
     use_amp = bool(cfg['misc'].get('use_amp', True)) and device == 'cuda'
@@ -368,15 +444,6 @@ def main():
     resume_path = args.resume or str(cfg['misc'].get('resume') or '')
     start_epoch = 1
     global_step = 0
-    # MMM/TMCL 超参（统一从 cfg 读取）
-    mmm_cfg = dict(cfg.get('mmm', {}))
-    mmm_ratio = float(mmm_cfg.get('mask_ratio', 0.15))
-    graph_cfg = dict(cfg.get('graph', {}))
-    graph_ratio_l = float(graph_cfg.get('mask_ratio_light', mmm_ratio))
-    graph_ratio_h = float(graph_cfg.get('mask_ratio_heavy', mmm_ratio))
-    graph_temp = float(graph_cfg.get('temperature', 0.2))
-    graph_loss_type = str(graph_cfg.get('loss', 'tmcl')).lower()
-    graph_margin = float(graph_cfg.get('margin', 0.2))
     best_val = float('inf')
     if resume_path and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location='cpu')
@@ -402,22 +469,51 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         print(f"Epoch {epoch}/{epochs} - training...")
         model.train()
-        # 保险丝持久化状态（跨 step 保持）
-        safeguard_until_step = -1
-        sg_bad_count = 0
-        sg_good_count = 0
+        # for it, batch in enumerate(dl_train, start=1):
+        #     batch = batch.to(device)
         for it, batch in enumerate(dl_train, start=1):
+            # 在 CPU 上检查 batched motif graph
+            num_motifs_total = int(batch.num_motifs.sum().item())
+            mei = batch.motif_edge_index
+            if mei.numel() > 0:
+                mx = int(mei.max().item())
+                mn = int(mei.min().item())
+                E = int(mei.size(1))
+                assert 0 <= mn and mx < num_motifs_total, (
+                    f"CPU check failed: motif_edge_index out of bounds: "
+                    f"min={mn}, max={mx}, num_motifs_total={num_motifs_total}, E={E}"
+                )
+                assert batch.motif_edge_attr.size(0) == E, (
+                    f"motif_edge_attr rows {batch.motif_edge_attr.size(0)} != E {E}"
+                )
+                assert batch.motif_edge_neighbor_type.numel() == E, (
+                    f"motif_edge_neighbor_type len {batch.motif_edge_neighbor_type.numel()} != E {E}"
+                )
+                assert batch.motif_edge_attach_pos_src.numel() == E, (
+                    f"motif_edge_attach_pos_src len {batch.motif_edge_attach_pos_src.numel()} != E {E}"
+                )
+                assert batch.motif_edge_attach_pos_dst.numel() == E, (
+                    f"motif_edge_attach_pos_dst len {batch.motif_edge_attach_pos_dst.numel()} != E {E}"
+                )
+
+            _check_neighbor_type_range(batch, int(model.neighbor_type_vocab), f"in train loop (epoch={epoch}, iter={it})")
+
             batch = batch.to(device)
             # 按步应用损失权重与调度（熵/均衡/commit 等）
             weights_cur = current_weights(global_step)
-            # Prototype Top‑K 调度：前期使用更宽的 top‑k，后期收敛为 1
-            if isinstance(proto_sched, dict):
-                if stage2_until > 0 and global_step < stage2_until:
-                    k_cur = stage2_k
-                else:
-                    k_cur = final_k
-                if hasattr(model, 'set_proto_topk'):
-                    model.set_proto_topk(int(k_cur))
+            # 路由温度调度（应用于模型前向）
+            # 原型温度 tau_r：线性从 start→end，后期可选 boost；可被熵闭环覆盖
+            if warmup_steps > 0:
+                p_tau = min(1.0, max(0.0, float(global_step) / float(max(1, warmup_steps))))
+            else:
+                p_tau = 1.0
+            tau_sched = tau_r_start + (tau_r_end - tau_r_start) * p_tau
+            if boost_start >= 0 and boost_dur > 0 and global_step >= boost_start:
+                q = min(1.0, max(0.0, float(global_step - boost_start) / float(max(1, boost_dur))))
+                tau_sched = tau_sched + (boost_end_tau - tau_r_end) * q
+            tau_apply = float(tau_sched)
+            if hasattr(model, 'set_router_temperature'):
+                model.set_router_temperature(tau_apply)
             # 教师温度退火（若启用），按步更新到模型
             if hasattr(model, 'set_teacher_temperature') and getattr(model, 'teacher_enabled', False):
                 if tt_decay_start >= 0 and tt_decay_steps > 0:
@@ -430,61 +526,9 @@ def main():
                     tt = float(rcfg.get('teacher_temperature', tt_start))
                 model.set_teacher_temperature(float(tt))
             with torch.cuda.amp.autocast(enabled=use_amp):
-                freeze_now = (global_step < delta_freeze_steps)
-                h_motif_2d, h_enh, router_info = model(batch, freeze_delta=freeze_now)
+                h_motif_2d, h_enh, router_info = model(batch)
                 losses = compute_losses(h_motif_2d=h_motif_2d, router=router_info, weights=weights_cur)
                 loss_total = losses['loss']
-
-                # 1) Masked Motif Modeling (MMM) —— 目标使用 gt_nn_index（几何最近原型）
-                mmm_w = float(cfg.get('loss', {}).get('mmm_weight', 0.0))
-                if mmm_w > 0.0:
-                    num_motifs = int(batch.motif_target.size(0))
-                    prob = torch.full((num_motifs,), mmm_ratio, device=batch.motif_target.device)
-                    msk = torch.bernoulli(prob).bool()
-                    if msk.any():
-                        _, _, info_m = model(batch, motif_mask=msk, freeze_delta=freeze_now)
-                        assert 'gt_nn_index' in router_info, 'router_info.gt_nn_index missing for MMM target'
-                        k_target = router_info['gt_nn_index']
-                        ce_mmm = F.cross_entropy(info_m['logits_code'][msk].float(), k_target[msk].long())
-                        loss_total = loss_total + mmm_w * ce_mmm
-                        losses['mmm'] = ce_mmm
-
-                # 2) Graph-level masked contrastive (TMCL 风格)
-                g_w = float(cfg.get('loss', {}).get('graph_weight', 0.0))
-                if g_w > 0.0:
-                    num_motifs = int(batch.motif_target.size(0))
-                    prob_l = torch.full((num_motifs,), graph_ratio_l, device=batch.motif_target.device)
-                    prob_h = torch.full((num_motifs,), graph_ratio_h, device=batch.motif_target.device)
-                    m1 = torch.bernoulli(prob_l).bool()
-                    m2 = torch.bernoulli(prob_h).bool()
-                    # 两个掩码视图
-                    _, _, info_m1 = model(batch, motif_mask=m1, freeze_delta=freeze_now)
-                    _, _, info_m2 = model(batch, motif_mask=m2, freeze_delta=freeze_now)
-                    # motif → graph READOUT（sum/mean）
-                    from momo.data.pcqm4mv2 import _infer_num_motifs_per_graph
-                    g_counts = _infer_num_motifs_per_graph(batch.motif_id, batch.batch)
-                    motif_graph_ids = torch.repeat_interleave(torch.arange(g_counts.numel(), device=g_counts.device), g_counts)
-                    def _graph_readout(feat: torch.Tensor) -> torch.Tensor:
-                        outg = torch.zeros((g_counts.numel(), feat.size(1)), dtype=feat.dtype, device=feat.device)
-                        outg = outg.index_add(0, motif_graph_ids, feat)
-                        if str(cfg['model'].get('readout','sum')).lower() == 'mean':
-                            denom = g_counts.clamp(min=1).view(-1, 1).to(outg.dtype)
-                            outg = outg / denom
-                        return outg
-                    h_enh = router_info['h_motif_enh']
-                    g0 = _graph_readout(h_enh)
-                    g1 = _graph_readout(info_m1['h_motif_enh'])
-                    g2 = _graph_readout(info_m2['h_motif_enh'])
-                    # 对比损失（采用 NT-Xent 近似 TMCL）
-                    def _nt_xent(a: torch.Tensor, p: torch.Tensor, t: float) -> torch.Tensor:
-                        a_n = F.normalize(a, dim=-1)
-                        p_n = F.normalize(p, dim=-1)
-                        logits = a_n @ p_n.t() / max(t, 1e-8)
-                        targets = torch.arange(a.size(0), device=a.device)
-                        return F.cross_entropy(logits, targets)
-                    loss_graph = 0.5 * (_nt_xent(g0, g1, graph_temp) + _nt_xent(g0, g2, graph_temp))
-                    loss_total = loss_total + g_w * loss_graph
-                    losses['graph'] = loss_graph
 
             # 不做数值兜底，保持快速失败
 
@@ -505,60 +549,41 @@ def main():
 
             # TensorBoard logging (train)
             if global_step % log_every == 0:
-                # 记录实际反传总损与主链路基础损
                 writer.add_scalar('train/loss', float(loss_total.detach().cpu()), global_step)
                 writer.add_scalar('train/loss_base', float(losses['loss'].detach().cpu()), global_step)
-                writer.add_scalar('train/recon', float(losses['recon'].detach().cpu()), global_step)
-                writer.add_scalar('train/proto_recon', float(losses['proto_recon'].detach().cpu()), global_step)
-                writer.add_scalar('train/delta_res', float(losses['delta_res'].detach().cpu()), global_step)
+                writer.add_scalar('train/edge', float(losses['edge'].detach().cpu()), global_step)
+                writer.add_scalar('train/main_3d', float(losses['main_3d'].detach().cpu()), global_step)
+                writer.add_scalar('train/template', float(losses['template'].detach().cpu()), global_step)
                 writer.add_scalar('train/orth', float(losses['orth'].detach().cpu()), global_step)
                 writer.add_scalar('train/vq', float(losses['vq'].detach().cpu()), global_step)
                 writer.add_scalar('train/commit', float(losses['commit'].detach().cpu()), global_step)
+                writer.add_scalar('train/delta_l2', float(losses['delta_l2'].detach().cpu()), global_step)
+                writer.add_scalar('train/ctx_delta_l2', float(losses['ctx_delta_l2'].detach().cpu()), global_step)
+                writer.add_scalar('train/ctx_delta_orth', float(losses['ctx_delta_orth'].detach().cpu()), global_step)
                 writer.add_scalar('train/lr', optim.param_groups[0]['lr'], global_step)
-                if 'mmm' in losses:
-                    writer.add_scalar('train/mmm', float(losses['mmm'].detach().cpu()), global_step)
-                if 'graph' in losses:
-                    writer.add_scalar('train/graph', float(losses['graph'].detach().cpu()), global_step)
-                writer.add_scalar('train/kl', float(losses['kl'].detach().cpu()), global_step)
-                writer.add_scalar('train/ce', float(losses['ce'].detach().cpu()), global_step)
-                writer.add_scalar('train/ent', float(losses['ent'].detach().cpu()), global_step)
-                writer.add_scalar('train/balance', float(losses['balance'].detach().cpu()), global_step)
-                writer.add_scalar('train/geom_align', float(losses['geom_align'].detach().cpu()), global_step)
-                # 原型 Top‑1 命中率与使用度（几何目标）
-                assert 'gt_nn_index' in router_info, 'router_info.gt_nn_index missing'
-                sel = torch.argmax(router_info['p_code'].detach(), dim=-1)
-                nn_idx = router_info['gt_nn_index'].detach()
-                hit = (sel == nn_idx).float().mean().item()
-                writer.add_scalar('train/router/top1_nn_hit', hit, global_step)
+
+                sel = router_info['code_idx'].detach()
                 used = torch.unique(sel).numel() / float(model.codebook_size)
                 writer.add_scalar('train/router/usage_unique_ratio', used, global_step)
-                # 有效代码数
-                y_soft = router_info['y_soft'].detach()
-                p_mean = y_soft.mean(dim=0)
+                p_code_soft = router_info['p_code_soft'].detach()
+                p_mean = p_code_soft.mean(dim=0)
                 eps = 1e-8
                 eff = torch.exp(-(p_mean * (p_mean + eps).log()).sum()).item()
                 writer.add_scalar('train/router/effective_codes', eff, global_step)
-                ys_clamped = torch.clamp(y_soft, min=eps)
+                ys_clamped = torch.clamp(p_code_soft, min=eps)
                 ent_per = (-ys_clamped * ys_clamped.log()).sum(dim=-1)
                 eff_sample = torch.exp(ent_per).mean().item()
                 writer.add_scalar('train/router/effective_codes_sample', eff_sample, global_step)
-                # 专家负载均衡
-                if 'exp_balance' in losses:
-                    writer.add_scalar('train/exp_balance', float(losses['exp_balance'].detach().cpu()), global_step)
                 print(f"step {global_step}: loss={float(loss_total.detach().cpu()):.4f} base={float(losses['loss'].detach().cpu()):.4f}"
-                      f" recon={float(losses['recon'].detach().cpu()):.4f}"
-                      f" proto_recon={float(losses['proto_recon'].detach().cpu()):.4f}"
-                      f" delta_res={float(losses['delta_res'].detach().cpu()):.4f}"
+                      f" edge={float(losses['edge'].detach().cpu()):.4f}"
+                      f" main_3d={float(losses['main_3d'].detach().cpu()):.4f}"
+                      f" template={float(losses['template'].detach().cpu()):.4f}"
                       f" orth={float(losses['orth'].detach().cpu()):.4f}"
                       f" vq={float(losses['vq'].detach().cpu()):.4f}"
                       f" commit={float(losses['commit'].detach().cpu()):.4f}"
-                      f" kl={float(losses['kl'].detach().cpu()):.4f}"
-                      f" ce={float(losses['ce'].detach().cpu()):.4f}"
-                      f" ent={float(losses['ent'].detach().cpu()):.4f}"
-                      f" balance={float(losses['balance'].detach().cpu()):.4f}"
-                      f" exp_balance={float(losses.get('exp_balance', torch.tensor(0.0)).detach().cpu()):.4f}"
-                      f" mmm={float(losses.get('mmm', torch.tensor(0.0)).detach().cpu()):.4f}"
-                      f" graph={float(losses.get('graph', torch.tensor(0.0)).detach().cpu()):.4f}")
+                      f" delta_l2={float(losses['delta_l2'].detach().cpu()):.4f}"
+                      f" ctx_delta_l2={float(losses['ctx_delta_l2'].detach().cpu()):.4f}"
+                      f" ctx_delta_orth={float(losses['ctx_delta_orth'].detach().cpu()):.4f}")
 
             global_step += 1
 
@@ -566,38 +591,37 @@ def main():
             if eval_every_steps > 0 and (global_step % eval_every_steps == 0):
                 metrics = eval_epoch(model, dl_val, device, cfg['loss'])
                 writer.add_scalar('val/loss', metrics['loss'], global_step)
-                writer.add_scalar('val/recon', metrics['recon'], global_step)
-                writer.add_scalar('val/proto_recon', metrics['proto_recon'], global_step)
-                writer.add_scalar('val/delta_res', metrics['delta_res'], global_step)
+                writer.add_scalar('val/edge', metrics['edge'], global_step)
+                writer.add_scalar('val/main_3d', metrics['main_3d'], global_step)
+                writer.add_scalar('val/template', metrics['template'], global_step)
                 writer.add_scalar('val/orth', metrics['orth'], global_step)
                 writer.add_scalar('val/vq', metrics['vq'], global_step)
                 writer.add_scalar('val/commit', metrics['commit'], global_step)
+                writer.add_scalar('val/ctx_delta_l2', metrics['ctx_delta_l2'], global_step)
+                writer.add_scalar('val/ctx_delta_orth', metrics['ctx_delta_orth'], global_step)
                 print(f"[step-eval] step {global_step} eval: loss={metrics['loss']:.4f}"
-                      f" recon={metrics['recon']:.4f} proto_recon={metrics['proto_recon']:.4f}"
-                      f" delta_res={metrics['delta_res']:.4f} orth={metrics['orth']:.4f}"
-                      f" vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}")
+                      f" edge={metrics['edge']:.4f} main_3d={metrics['main_3d']:.4f}"
+                      f" template={metrics['template']:.4f}"
+                      f" orth={metrics['orth']:.4f} vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}"
+                      f" ctx_delta_l2={metrics['ctx_delta_l2']:.4f} ctx_delta_orth={metrics['ctx_delta_orth']:.4f}")
 
         # Eval per epoch
         if (epoch % eval_every) == 0:
             metrics = eval_epoch(model, dl_val, device, cfg['loss'])
-            # 用当前 global_step 写入，便于与训练曲线对齐
             writer.add_scalar('val/loss', metrics['loss'], global_step)
-            writer.add_scalar('val/recon', metrics['recon'], global_step)
-            writer.add_scalar('val/proto_recon', metrics['proto_recon'], global_step)
-            writer.add_scalar('val/delta_res', metrics['delta_res'], global_step)
+            writer.add_scalar('val/edge', metrics['edge'], global_step)
+            writer.add_scalar('val/main_3d', metrics['main_3d'], global_step)
+            writer.add_scalar('val/template', metrics['template'], global_step)
             writer.add_scalar('val/orth', metrics['orth'], global_step)
             writer.add_scalar('val/vq', metrics['vq'], global_step)
             writer.add_scalar('val/commit', metrics['commit'], global_step)
-            writer.add_scalar('val/kl', metrics['kl'], global_step)
-            writer.add_scalar('val/ce', metrics['ce'], global_step)
-            writer.add_scalar('val/ent', metrics['ent'], global_step)
-            writer.add_scalar('val/balance', metrics['balance'], global_step)
+            writer.add_scalar('val/ctx_delta_l2', metrics['ctx_delta_l2'], global_step)
+            writer.add_scalar('val/ctx_delta_orth', metrics['ctx_delta_orth'], global_step)
             print(f"Epoch {epoch} eval: loss={metrics['loss']:.4f}"
-                  f" recon={metrics['recon']:.4f} proto_recon={metrics['proto_recon']:.4f}"
-                  f" delta_res={metrics['delta_res']:.4f} orth={metrics['orth']:.4f}"
-                  f" vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}"
-                  f" kl={metrics['kl']:.4f} ce={metrics['ce']:.4f} ent={metrics['ent']:.4f}")
-            # 单一路径：不使用 teacher_auto 或校准阶段
+                  f" edge={metrics['edge']:.4f} main_3d={metrics['main_3d']:.4f}"
+                  f" template={metrics['template']:.4f}"
+                  f" orth={metrics['orth']:.4f} vq={metrics['vq']:.4f} commit={metrics['commit']:.4f}"
+                  f" ctx_delta_l2={metrics['ctx_delta_l2']:.4f} ctx_delta_orth={metrics['ctx_delta_orth']:.4f}")
 
         # Step scheduler
         if scheduler is not None:

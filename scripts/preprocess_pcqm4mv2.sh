@@ -12,6 +12,7 @@ set -euo pipefail
 conda activate /ibex/user/songt/conda_envs/momo
 
 # ---------------- PCQM4Mv2 (SDF) ----------------
+# Default: only run PCQM here. Enable MoleculeNet explicitly if needed.
 RUN_PCQM=${RUN_PCQM:-1}
 PCQM_SDF=${PCQM_SDF:-data/pcqm4m-v2-train.sdf}
 PCQM_OUT=${PCQM_OUT:-data/pcqm4m_v2_motif_preprocessed.pkl}
@@ -26,7 +27,9 @@ if [[ "$RUN_PCQM" == "1" ]]; then
 fi
 
 # ---------------- MoleculeNet (SMILES) ----------------
-RUN_MOLNET=${RUN_MOLNET:-1}
+# Do not run MoleculeNet by default from this script.
+# Use scripts/preprocess_moleculenet_motif.sh or set RUN_MOLNET=1 explicitly.
+RUN_MOLNET=${RUN_MOLNET:-0}
 DATA_ROOT=${DATA_ROOT:-/ibex/user/songt/datasets/dataset}
 DATASETS=${DATASETS:-"bbbp,esol,freesolv,lipophilicity,tox21,toxcast,clintox,sider,muv,hiv,bace"}
 MOLNET_LIMIT=${MOLNET_LIMIT:--1}

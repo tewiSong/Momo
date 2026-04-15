@@ -80,9 +80,9 @@ z_{hat} \approx teacher_z
   - Prototype 路由输入用无上下文 h_motif_local，但监督目标 gt_nn_index/p_gt 来自 z3d_gt→zgt_proj 的最近邻（包含上下文效应）。
   - commit 拉近 h_motif_local→e_selected，而 CE/KL 拉向含上下文的 gt_nn_index，二者长期对冲。
 
-- 修复1（冻结 Δ 全链路生效）
-  - 模型前向新增 freeze_delta 开关，开启时强制 h_motif_enh=e_hat，z_pred=z_proto，delta=0，适用于主链路与所有辅助前向。
-  - 训练脚本统一在 global_step<delta_freeze_steps 时对主链路、MMM、Graph 前向传入 freeze_delta=True。
+- 修复1（旧版 Δ 分阶段训练逻辑）
+  - 模型前向曾支持将 h_motif_enh 降回 e_hat、并令 delta=0，用于主链路与所有辅助前向保持一致。
+  - 训练脚本曾在训练早期对主链路、MMM、Graph 使用同一分阶段路径。
   - 同步移除只改主链路 router_info 的手工覆写，避免不一致。
 
 - 修复2（日志对齐实际优化目标）
@@ -95,8 +95,8 @@ z_{hat} \approx teacher_z
   - 未引入兜底/容错路径，监督侧对 Δ 严格 stop‑grad，确保“Δ=上下文修正”。
 
 - 受影响文件
-  - momo/models/gin_motif_vqmoe.py：新增 freeze_delta；p_gt/gt_nn_index 基于 z_template；统一导出 delta。
-  - momo/train/pretrain.py：所有前向在冻结期传 freeze_delta；训练日志记录 total 和 base。
+  - momo/models/gin_motif_vqmoe.py：曾引入分阶段 delta 路径；p_gt/gt_nn_index 基于 z_template；统一导出 delta。
+  - momo/train/pretrain.py：曾在训练前期统一走分阶段路径；训练日志记录 total 和 base。
 
 
 0404
@@ -110,14 +110,14 @@ z_{hat} \approx teacher_z
      - vq 仍贴 zgt_proj；
      - proto_recon 仍用 z3d_gt 监督 z_proto；
      与“prototype=上下文无关模板”定义相悖，导致 commit 与 CE/KL 的长期拉扯，诱发码本使用度塌缩。
-  2) freeze_delta 不纯：冻结期 p_gt/gt_nn_index 的模板仍含当步 Δ 的估计（虽 detach），冻结阶段的监督目标被 Δ 影响。
+  2) 旧版分阶段 delta 路径不纯：前期 p_gt/gt_nn_index 的模板仍含当步 Δ 的估计（虽 detach），监督目标被 Δ 影响。
 
 - 本次修复（不引入兜底/容错）
   - 统一模板监督：
     - vq 改为 MSE(e_target, z_template)；
     - proto_recon 改为 latent 空间 MSE(e_hat, z_template)（不再经由解码头生成模板几何）；
     - router_info 导出 z_template（模板 latent），不再导出 z_template_geom。
-  - 冻结期纯化模板：freeze_delta=True 时，计算模板目标时显式用 Δ=0（不再使用 Δ 的当步估计）。
+  - 训练前期纯化模板：阶段路径启用时，计算模板目标显式用 Δ=0（不再使用 Δ 的当步估计）。
 
 - 预期效果
   - 消除 commit 与 CE/KL 的定义对冲，原型聚类按“模板”收敛，码本使用度/熵回升、balance 下降，exp_balance 改善；
@@ -130,3 +130,51 @@ z_{hat} \approx teacher_z
 - 验证建议
   - 重点观察：router/effective_codes、entropy、balance、exp_balance、proto_recon、kl/ce；
   - 对比冻结窗口内外的指标变化，确认模板监督与冻结纯化带来的改善。
+
+0406
+- 现象
+  - 配置已有 gumbel_tau/beta/entropy_target/tau_r_* 等路由控制，但前向仍是固定温度的 softmax(logits)，未见温控/β 融合/熵闭环的实际作用。
+  - 表现为：entropy 快速走低、effective_codes 与 usage_unique_ratio 偏低，MMM/CE 偏高并主导总损，码本使用塌缩。
+
+- 原因
+ - 训练脚本仅解析了 τ/β/熵目标，但没有把这些参数应用到模型；模型也无可调用的 setter 去更新前向中的温度/β。
+  - teacher 分布仅计算未用于融合，缺少早期平滑牵引。
+
+- 修了什么
+  - 模型（momo/models/gin_motif_vqmoe.py）
+    - 新增路由控制状态与接口：router_tau/router_beta/router_use_gumbel；set_router_temperature(tau)；set_router_beta(beta)。
+    - 前向引入温控与可选 Gumbel：p_model = softmax(logits/tau) 或 gumbel_softmax(logits, tau)。
+    - 若启用 teacher：p = (1-β)·p_model + β·p_t；再做 Top‑K+ST 选通。
+    - 导出 y_soft（用于训练与闭环）与 p_code_soft_raw（诊断温控/融合效果）。
+  - 训练（momo/train/pretrain.py）
+    - 每步按 warmup 与 tau_r_boost 调度 τ，并调用 set_router_temperature。
+    - 若启用 teacher，同步调度 β 并 set_router_beta；支持 late boost。
+    - 熵目标闭环：用当前 batch 的路由熵调节下一步 τ，限制在 [tau_r_min, tau_r_max]。
+
+  - 预期效果
+    - 有效码本数与熵上升并在目标区间稳定，usage_unique_ratio 提升，码本塌缩明显缓解；balance/exp_balance 下降。
+    - MMM/CE 更平滑且不过早极尖；KL 稳步下降；base/val 更稳定。
+    - 启用 teacher 时：早期路由更稳，top1_nn_hit 更平滑提升；中后期随 β 提升逐步更信模型路由。
+
+0407
+- 现象（来自最新日志 pretrain-pcqm4mv2.46410568.out）
+  - 约 405k 后 val/loss 抖升；410k 附近出现 proto_recon/orth 异常飙高；420k 起训练与评估多项指标同步 NaN。
+  - 爆发前一刻：`base ≈ 1.x`，但 `mmm ≈ 13~14`，总损被 MMM 主导；NaN 发生时 `exp_balance` 仍为有限值，说明先炸的是 prototype 路由链而非专家链。
+
+- 根因（实现不一致放大至数值崩溃）
+  - 前向“选码”分布已切换为温度/Gumbel/teacher‑β 融合得到的 `p_code_soft` 并用于 Top‑K 与 e_hat（模型导出 `router['p_code_soft']`/`y_soft`）。
+  - 但 loss 中 KL/entropy/balance 仍以 `softmax(logits_code)` 旧分布计算，导致“按 A 分布选”“按 B 分布罚”，训练目标互相对冲。
+  - 同期 `mmm_weight=1.0` 使得路由端的轻微不稳被显著放大，触发连锁 NaN。
+
+- 修复
+  - 统一路由分布来源：`compute_losses` 改为强制使用 `router['p_code_soft']` 计算 KL/entropy/balance；删除在 loss 内部对 `logits_code` 的重复 softmax（快速失败：缺少该字段即断言）。
+    - 受影响：momo/train/losses.py。
+  - 降低 MMM 权重：将 `mmm_weight` 从 1.0 降至 0.3，避免在路由未完全稳定时主导总损。
+    - 受影响：configs/pretrain_pcqm4mv2.yaml。
+
+- 预期效果
+  - “选码/挨罚”一致，路由监督与选择目标同向，训练稳定性恢复；NaN 风险显著下降。
+  - MMM 对总损的影响回到合理区间，避免放大路由抖动。
+
+- 验证建议
+  - 短程跑若干千步，重点观察：val/loss、recon、proto_recon、KL/CE、entropy、balance、router/effective_codes、router/top1_nn_hit；确认无再次 NaN 且路由熵/有效码本数处于健康区间。
